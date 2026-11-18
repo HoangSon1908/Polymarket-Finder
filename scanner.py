@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -22,6 +23,7 @@ st.set_page_config(
 LEADERBOARD_V2_URL = "https://data-api.polymarket.com/v2/leaderboard"
 LEADERBOARD_V1_URL = "https://data-api.polymarket.com/v1/leaderboard"
 VN_TZ = timezone(timedelta(hours=7))
+EVM_ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
 # Đủ 11 danh mục khớp 100% với dropdown trên polymarket.com/leaderboard
 CATEGORY_OPTIONS: dict[str, str] = {
@@ -54,7 +56,7 @@ def build_http_session() -> requests.Session:
     session.headers.update(
         {
             "Accept": "application/json",
-            "User-Agent": "Polymarket-Wallet-Finder/1.0",
+            "User-Agent": "Polymarket-Wallet-Finder/1.1",
         }
     )
     return session
@@ -81,6 +83,72 @@ def request_json_with_retry(
             if attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
     raise RuntimeError(f"Gọi {url} thất bại với params={params}: {last_err}")
+
+
+def _extract_wallet_address(item: dict[str, Any]) -> str:
+    """Tự động dò địa chỉ ví 0x... kể cả khi API đổi tên trường hoặc lồng object."""
+    candidate_keys = (
+        "proxy_wallet",
+        "proxyWallet",
+        "wallet",
+        "wallet_address",
+        "walletAddress",
+        "user_address",
+        "userAddress",
+        "address",
+        "account",
+        "user",
+        "id",
+    )
+    for k in candidate_keys:
+        val = item.get(k)
+        if isinstance(val, str):
+            s = val.strip()
+            if EVM_ADDR_RE.match(s):
+                return s.lower()
+        elif isinstance(val, dict):
+            nested = _extract_wallet_address(val)
+            if nested:
+                return nested
+
+    # Quét toàn bộ giá trị chuỗi trong record nếu khóa nằm ngoài danh sách trên
+    for val in item.values():
+        if isinstance(val, str):
+            s = val.strip()
+            if EVM_ADDR_RE.match(s):
+                return s.lower()
+        elif isinstance(val, dict):
+            for sub_val in val.values():
+                if isinstance(sub_val, str) and EVM_ADDR_RE.match(sub_val.strip()):
+                    return sub_val.strip().lower()
+
+    return ""
+
+
+def _pick_first_str(item: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for k in keys:
+        val = item.get(k)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    for sub_key in ("user", "profile", "account"):
+        sub = item.get(sub_key)
+        if isinstance(sub, dict):
+            for k in keys:
+                val = sub.get(k)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    return ""
+
+
+def _pick_first_float(item: dict[str, Any], keys: tuple[str, ...], default: float = 0.0) -> float:
+    for k in keys:
+        val = item.get(k)
+        if val is not None and not isinstance(val, (dict, list, bool)):
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                continue
+    return default
 
 
 # ==============================================================================
@@ -207,51 +275,54 @@ def step1_fetch_leaderboard(
     seen_wallets: set[str] = set()
 
     for idx, item in enumerate(raw_records, start=1):
-        wallet = str(
-            item.get("proxy_wallet")
-            or item.get("proxyWallet")
-            or item.get("user")
-            or item.get("address")
-            or ""
-        ).strip().lower()
-
-        if not wallet or wallet in seen_wallets:
+        wallet = _extract_wallet_address(item)
+        dedup_key = wallet if wallet else f"unknown_{idx}"
+        if dedup_key in seen_wallets:
             continue
-        seen_wallets.add(wallet)
+        seen_wallets.add(dedup_key)
 
-        raw_rank = item.get("rank")
+        raw_rank = item.get("rank") or item.get("position")
         try:
             rank_val = int(raw_rank) if raw_rank is not None else idx
         except (ValueError, TypeError):
             rank_val = idx
 
-        user_name = str(
-            item.get("user_name")
-            or item.get("userName")
-            or item.get("name")
-            or item.get("pseudonym")
-            or ""
-        ).strip()
+        user_name = _pick_first_str(
+            item, ("user_name", "userName", "username", "name", "pseudonym", "display_name")
+        )
+        if not user_name:
+            user_name = f"{wallet[:6]}...{wallet[-4:]}" if wallet else f"Trader #{rank_val}"
 
-        pnl_val = float(item.get("pnl") or item.get("total_pnl") or item.get("profit") or 0.0)
-        vol_val = float(item.get("vol") or item.get("total_volume") or item.get("volume") or 0.0)
+        pnl_val = _pick_first_float(item, ("pnl", "total_pnl", "totalPnl", "profit", "net_pnl"))
+        vol_val = _pick_first_float(item, ("vol", "volume", "total_volume", "totalVolume", "usdc_volume"))
         pnl_vol_pct = (pnl_val / vol_val * 100.0) if vol_val > 0 else 0.0
+
+        x_user = _pick_first_str(item, ("x_username", "xUsername", "twitter", "x_handle"))
+        verified_flag = bool(
+            item.get("verified_badge")
+            or item.get("verifiedBadge")
+            or item.get("verified")
+            or False
+        )
 
         normalized_rows.append(
             {
                 "rank": rank_val,
-                "user_name": user_name if user_name else f"{wallet[:6]}...{wallet[-4:]}",
-                "wallet": wallet,
+                "user_name": user_name,
+                "wallet": wallet if wallet else "N/A (Xem Raw JSON)",
                 "pnl_usdc": round(pnl_val, 2),
                 "ui_volume_usdc": round(vol_val, 2),
                 "pnl_to_ui_vol_pct": round(pnl_vol_pct, 2),
-                "x_username": str(item.get("x_username") or item.get("xUsername") or "").strip(),
-                "verified": bool(item.get("verified_badge") or item.get("verifiedBadge") or False),
+                "x_username": x_user,
+                "verified": verified_flag,
                 "category": cat_code,
                 "time_period": tp_code,
-                "profile_url": f"https://polymarket.com/profile/{wallet}",
+                "profile_url": f"https://polymarket.com/profile/{wallet}" if wallet else "",
             }
         )
+
+    if not normalized_rows:
+        return pd.DataFrame(), meta
 
     df = pd.DataFrame(normalized_rows).sort_values("rank", ascending=True).reset_index(drop=True)
     meta["returned_count"] = len(df)
@@ -298,7 +369,6 @@ st.caption(
     "*Bước 3: Kiểm toán sổ cái sâu (Chờ)*."
 )
 
-# Thanh trạng thái 3 bước của pipeline
 s1, s2, s3 = st.columns(3)
 s1.success("✅ **Bước 1: Thu thập Top N ví**\n\nĐang hoạt động (Dữ liệu gốc 100%)")
 s2.info("⏳ **Bước 2: Lọc bề mặt & độ tươi**\n\nChưa triển khai (Pass-through)")
@@ -306,18 +376,17 @@ s3.info("⏳ **Bước 3: Kiểm toán sổ cái sâu**\n\nChưa triển khai (P
 
 st.divider()
 
-# Bộ chọn tham số đầu vào cho Bước 1
 c1, c2, c3, c4 = st.columns([2.2, 1.4, 1.2, 1.0])
 
 selected_cat_label = c1.selectbox(
     "Chọn Category",
     options=list(CATEGORY_OPTIONS.keys()),
-    index=0,  # Mặc định Esports
+    index=0,
 )
 selected_range_label = c2.selectbox(
     "Chọn Range (Khung thời gian)",
     options=list(RANGE_OPTIONS.keys()),
-    index=2,  # Mặc định Monthly
+    index=2,
 )
 selected_order = c3.selectbox(
     "Xếp hạng theo",
@@ -348,7 +417,6 @@ if "pipeline_meta" not in st.session_state:
 
 if run_clicked:
     with st.spinner(f"Đang thực thi Bước 1: Kéo Top {int(selected_top_n)} ví từ `{cat_code}` ({range_code})..."):
-        # Chạy tuần tự qua 3 bước của pipeline
         df_step1, meta = step1_fetch_leaderboard(
             category=cat_code,
             time_period=range_code,
@@ -370,7 +438,7 @@ meta_result: dict[str, Any] = st.session_state["pipeline_meta"]
 if meta_result:
     if df_result.empty:
         st.error(
-            f"Không thu thập được dữ liệu từ API. Chi tiết lỗi: {meta_result.get('errors')}"
+            f"Không chuẩn hóa được dữ liệu ví nào. Chi tiết lỗi API: {meta_result.get('errors')}"
         )
     else:
         st.divider()
@@ -421,5 +489,6 @@ if meta_result:
             use_container_width=True,
         )
 
-        with st.expander("🔍 Kiểm tra Raw JSON Schema (3 bản ghi đầu tiên từ API)", expanded=False):
+    if meta_result.get("raw_records"):
+        with st.expander("🔍 Kiểm tra Raw JSON Schema (3 bản ghi đầu tiên từ API)", expanded=df_result.empty):
             st.json(meta_result.get("raw_records", [])[:3])
