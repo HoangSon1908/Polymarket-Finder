@@ -12,20 +12,21 @@ from requests.adapters import HTTPAdapter
 import streamlit as st
 
 st.set_page_config(
-    page_title="Polymarket Pro Wallet Finder",
-    page_icon="🎯",
+    page_title="Polymarket Pro Wallet Finder (Leaderboard Engine)",
+    page_icon="🏆",
     layout="wide",
 )
 
-GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
-GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
-TRADES_V2_URL = "https://data-api.polymarket.com/v2/trades"
+LEADERBOARD_V2_URL = "https://data-api.polymarket.com/v2/leaderboard"
+BIGGEST_WINNERS_V2_URL = "https://data-api.polymarket.com/v2/biggest-winners"
 LEADERBOARD_V1_URL = "https://data-api.polymarket.com/v1/leaderboard"
 POSITIONS_V2_URL = "https://data-api.polymarket.com/v2/positions"
 ACTIVITY_V2_URL = "https://data-api.polymarket.com/v2/activity"
 USER_STATS_V2_URL = "https://data-api.polymarket.com/v2/user-stats"
 USER_VOLUME_V2_URL = "https://data-api.polymarket.com/v2/user-volume"
 USER_PNL_V2_URL = "https://data-api.polymarket.com/v2/user-pnl"
+GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+TRADES_V2_URL = "https://data-api.polymarket.com/v2/trades"
 
 DEFAULT_BENCHMARK_WALLET = "0xc9bfc7986767173b4f1c3fc9b2c6b255fc7381c0"
 VN_TZ = timezone(timedelta(hours=7))
@@ -67,7 +68,7 @@ def request_with_retry(url: str, params: dict, retries: int = 3, timeout: int = 
     raise RuntimeError(f"Lỗi gọi {url}: {last_err}")
 
 
-def fetch_v2_paginated(url: str, wallet: str, extra_params: dict | None = None, max_pages: int = 12) -> list[dict]:
+def fetch_v2_paginated(url: str, wallet: str, extra_params: dict | None = None, max_pages: int = 25) -> list[dict]:
     """Kéo dữ liệu chuẩn Polymarket Data API v2 bằng phân trang cursor (không dùng offset)."""
     rows: list[dict] = []
     base_params = {"user": wallet.strip().lower(), "limit": 500}
@@ -102,13 +103,163 @@ def fetch_v2_paginated(url: str, wallet: str, extra_params: dict | None = None, 
 
 
 # ==============================================================================
-# 2. TẦNG 0: THU THẬP VÍ HẠT GIỐNG TỰ NHIÊN (MULTI-CLIP SEEDING)
+# 2. TẦNG 0: THU THẬP VÍ HẠT GIỐNG TỪ LEADERBOARD V2 (CHUẨN CURSOR)
 # ==============================================================================
+
+def fetch_single_leaderboard_board(
+    endpoint: str, category: str, time_period: str, target_count: int
+) -> tuple[list[dict], str]:
+    """Kéo 1 bảng xếp hạng từ /v2/leaderboard hoặc /v2/biggest-winners bằng phân trang cursor."""
+    rows: list[dict] = []
+    cursor = None
+    max_pages = max(1, math.ceil(target_count / 50))
+
+    tp_v2 = time_period.lower()
+    cat_v2 = category.upper()
+
+    for page_idx in range(max_pages):
+        if len(rows) >= target_count:
+            break
+
+        if cursor is None:
+            params = {
+                "category": cat_v2,
+                "time_period": tp_v2,
+                "order_by": "PNL",
+                "limit": min(50, target_count - len(rows)),
+            }
+        else:
+            params = {"cursor": cursor}
+
+        try:
+            payload = request_with_retry(endpoint, params=params)
+        except Exception as e:
+            if page_idx == 0:
+                return [], f"Lỗi {endpoint}: {e}"
+            break
+
+        if isinstance(payload, dict):
+            batch = payload.get("data") or payload.get("results") or []
+            pagination = payload.get("pagination") or {}
+            cursor = pagination.get("next_cursor")
+            has_more = pagination.get("has_more", bool(cursor))
+        elif isinstance(payload, list):
+            batch = payload
+            cursor = None
+            has_more = False
+        else:
+            break
+
+        if not batch:
+            break
+
+        for item in batch:
+            if not isinstance(item, dict):
+                continue
+            w = str(
+                item.get("proxy_wallet")
+                or item.get("proxyWallet")
+                or item.get("user")
+                or item.get("address")
+                or ""
+            ).strip().lower()
+            if not w.startswith("0x") or len(w) != 42:
+                continue
+
+            rank_val = item.get("rank") or (len(rows) + 1)
+            rows.append({
+                "wallet": w,
+                "userName": item.get("user_name") or item.get("userName") or item.get("name") or "",
+                "source_board": f"{cat_v2}/{tp_v2}",
+                "lb_rank": int(rank_val),
+                "lb_pnl": float(item.get("pnl") or item.get("total_pnl") or 0),
+                "lb_vol": float(item.get("vol") or item.get("volume") or item.get("total_volume") or 0),
+            })
+
+        if not cursor or not has_more:
+            break
+
+    return rows, ""
+
+
+def seed_wallets_from_leaderboard_multi(
+    categories: list[str], time_periods: list[str], limit_per_board: int, include_biggest_winners: bool = True
+) -> tuple[list[str], pd.DataFrame, list[str]]:
+    """
+    Tầng 0A (Chủ lực): Đào ví tự nhiên từ Data API /v2/leaderboard (và /v2/biggest-winners)
+    qua nhiều Category & khung thời gian, giữ thứ hạng cao nhất của từng ví.
+    """
+    logs: list[str] = []
+    all_rows: list[dict] = []
+
+    for cat in categories:
+        for tp in time_periods:
+            rows, err = fetch_single_leaderboard_board(LEADERBOARD_V2_URL, cat, tp, limit_per_board)
+            if err and not rows:
+                v1_rows = []
+                offset = 0
+                while len(v1_rows) < limit_per_board:
+                    try:
+                        p_v1 = request_with_retry(
+                            LEADERBOARD_V1_URL,
+                            {
+                                "category": cat.upper(),
+                                "timePeriod": tp.upper(),
+                                "orderBy": "PNL",
+                                "limit": min(50, limit_per_board - len(v1_rows)),
+                                "offset": offset,
+                            },
+                        )
+                        b_v1 = p_v1.get("data") or [] if isinstance(p_v1, dict) else (p_v1 or [])
+                        if not b_v1:
+                            break
+                        for item in b_v1:
+                            w = str(item.get("proxyWallet") or item.get("proxy_wallet") or item.get("user") or "").strip().lower()
+                            if w.startswith("0x") and len(w) == 42:
+                                v1_rows.append({
+                                    "wallet": w,
+                                    "userName": item.get("userName") or item.get("user_name") or "",
+                                    "source_board": f"{cat}/{tp}",
+                                    "lb_rank": len(v1_rows) + 1,
+                                    "lb_pnl": float(item.get("pnl") or 0),
+                                    "lb_vol": float(item.get("vol") or item.get("volume") or 0),
+                                })
+                        offset += 50
+                        if len(b_v1) < 50:
+                            break
+                    except Exception as e_v1:
+                        logs.append(f"Cảnh báo Leaderboard `{cat}/{tp}`: {err} | {e_v1}")
+                        break
+                rows = v1_rows
+
+            if rows:
+                logs.append(f"Leaderboard `{cat}/{tp}`: Kéo được **{len(rows)}** ví.")
+                all_rows.extend(rows)
+
+            if include_biggest_winners:
+                bw_rows, _ = fetch_single_leaderboard_board(BIGGEST_WINNERS_V2_URL, cat, tp, min(50, limit_per_board))
+                if bw_rows:
+                    for r in bw_rows:
+                        r["source_board"] = f"Winners:{cat}/{tp}"
+                    all_rows.extend(bw_rows)
+
+    if not all_rows:
+        return [], pd.DataFrame(), logs
+
+    df = pd.DataFrame(all_rows)
+    df = (
+        df.sort_values(["lb_rank", "lb_pnl"], ascending=[True, False])
+        .drop_duplicates(subset=["wallet"], keep="first")
+        .reset_index(drop=True)
+    )
+    logs.append(f"Tổng hợp sau khử trùng lặp: **{len(df)}** ví độc lập từ Leaderboard.")
+    return df["wallet"].tolist(), df, logs
+
 
 def seed_wallets_from_markets(
     category_filter: str, num_markets: int, min_accum_per_market: float
 ) -> tuple[list[str], pd.DataFrame, list[str]]:
-    """Đào ví tự nhiên từ Gamma API (/events) + Data API v2 (/v2/trades) theo gom lệnh đa clip."""
+    """Tầng 0B (Phụ trợ): Đào ví từ Gamma API (/events) + Data API v2 (/v2/trades)."""
     logs: list[str] = []
     raw_markets: list[dict] = []
 
@@ -138,34 +289,13 @@ def seed_wallets_from_markets(
             if len(ev_list) < 100:
                 break
         except Exception as e:
-            logs.append(f"Cảnh báo Gamma /events (offset={offset}): {e}")
+            logs.append(f"Cảnh báo Gamma /events: {e}")
             break
 
     kw_map = {
-        "Esports (CS2 / Dota / LoL / Valorant)": [
-            "counter-strike", "cs2", "dota", "league of legends", "lol:", "valorant",
-            "esports", "map 1", "map 2", "map handicap", "blast", "iem", "pgl", "cct"
-        ],
-        "Sports Truyền Thống (NBA / Tennis / Bóng đá / UFC)": [
-            "nba", "nfl", "nhl", "mlb", "ncaa", "atp", "wta", "tennis", "premier league",
-            "champions league", "la liga", "serie a", "bundesliga", "ligue 1", "soccer",
-            "football", "ufc", "mma", "f1", "formula 1", "set 1", "set handicap"
-        ],
-        "Tất cả Sports & Esports": [
-            "nba", "nfl", "nhl", "mlb", "ncaa", "atp", "wta", "tennis", "premier league",
-            "champions league", "la liga", "serie a", "bundesliga", "soccer", "football",
-            "counter-strike", "cs2", "dota", "league of legends", "valorant", "ufc", "f1",
-            "vs.", "vs ", "spread:", "o/u "
-        ],
-        "Finance (Chỉ số / Cổ phiếu / Vàng / Lãi suất)": [
-            "s&p", "spx", "nasdaq", "dow jones", "nvda", "tsla", "aapl", "msft", "amzn",
-            "gold", "silver", "oil", "crude", "fed", "fomc", "interest rate", "cpi",
-            "inflation", "treasury", "close above", "close below", "stock", "earnings"
-        ],
-        "Politics & Macro": [
-            "trump", "biden", "harris", "election", "senate", "house", "president",
-            "tariff", "minister", "parliament", "vote", "supreme court", "governor"
-        ],
+        "Esports (CS2 / Dota / LoL / Valorant)": ["counter-strike", "cs2", "dota", "league of legends", "valorant", "esports"],
+        "Sports Truyền Thống (NBA / Tennis / Bóng đá / UFC)": ["nba", "nfl", "nhl", "mlb", "atp", "wta", "tennis", "premier league", "champions league", "la liga", "soccer", "ufc"],
+        "Finance (Chỉ số / Cổ phiếu / Vàng / Lãi suất)": ["s&p", "nasdaq", "dow jones", "nvda", "tsla", "aapl", "gold", "oil", "fed", "cpi", "treasury", "close above"],
     }
 
     seen_cids: set[str] = set()
@@ -176,19 +306,14 @@ def seed_wallets_from_markets(
         cid = str(m.get("conditionId") or m.get("condition_id") or "").strip()
         if not cid or cid in seen_cids:
             continue
-
         full_text = f"{m.get('question', '')} {m.get('_ev_title', '')} {m.get('_ev_slug', '')} {m.get('_ev_cat', '')}".lower()
         if any(k in full_text for k in ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "up or down"]):
             continue
-
-        kws = kw_map.get(category_filter, [])
-        if any(k in full_text for k in kws):
+        if any(k in full_text for k in kw_map.get(category_filter, [])):
             seen_cids.add(cid)
             filtered_markets.append(m)
 
-    logs.append(f"Gamma API: Tìm thấy **{len(filtered_markets)}** market khớp nhóm `{category_filter}`.")
     target_markets = filtered_markets[:num_markets]
-
     pair_usdc: dict[tuple[str, str], float] = defaultdict(float)
     pair_clips: dict[tuple[str, str], int] = defaultdict(int)
     cid_title_map: dict[str, str] = {}
@@ -206,20 +331,13 @@ def seed_wallets_from_markets(
                 continue
         return cid, title, []
 
-    # Kéo /v2/trades song song trên 6 luồng
     with ThreadPoolExecutor(max_workers=6) as pool:
         for cid, title, trades_batch in pool.map(fetch_market_trades, target_markets):
             cid_title_map[cid] = title
             for t in trades_batch:
                 if not isinstance(t, dict):
                     continue
-                w = str(
-                    t.get("proxy_wallet")
-                    or t.get("proxyWallet")
-                    or t.get("user")
-                    or t.get("taker_address")
-                    or ""
-                ).strip().lower()
+                w = str(t.get("proxy_wallet") or t.get("proxyWallet") or t.get("user") or "").strip().lower()
                 if not w.startswith("0x") or len(w) != 42:
                     continue
                 size = float(t.get("size") or t.get("shares") or 0)
@@ -235,85 +353,18 @@ def seed_wallets_from_markets(
             continue
         rec = wallet_agg.setdefault(
             w,
-            {
-                "wallet": w,
-                "qualifying_markets": 0,
-                "total_clips": 0,
-                "seed_usdc": 0.0,
-                "max_single_market_usdc": 0.0,
-                "sample_market": cid_title_map.get(cid, ""),
-            },
+            {"wallet": w, "qualifying_markets": 0, "total_clips": 0, "seed_usdc": 0.0, "sample_market": cid_title_map.get(cid, "")},
         )
         rec["qualifying_markets"] += 1
         rec["total_clips"] += pair_clips[(w, cid)]
         rec["seed_usdc"] += tot_usdc
-        if tot_usdc > rec["max_single_market_usdc"]:
-            rec["max_single_market_usdc"] = tot_usdc
-            rec["sample_market"] = cid_title_map.get(cid, "")
 
     seed_df = pd.DataFrame(list(wallet_agg.values()))
     if not seed_df.empty:
         seed_df = seed_df.sort_values(["seed_usdc", "total_clips"], ascending=[False, False]).reset_index(drop=True)
-        logs.append(f"Data API `/v2/trades`: Thu thập tự nhiên được **{len(seed_df)}** ví có tổng gom >= ${min_accum_per_market:,.0f}/trận.")
+        logs.append(f"Market Trades: Thu thập được **{len(seed_df)}** ví.")
         return seed_df["wallet"].tolist(), seed_df, logs
-
-    logs.append("Chưa có ví nào đạt ngưỡng gom tối thiểu trên lô trận vừa quét.")
     return [], pd.DataFrame(), logs
-
-
-def seed_wallets_from_leaderboard(category: str, time_period: str, limit: int) -> tuple[list[str], pd.DataFrame, list[str]]:
-    logs: list[str] = []
-    rows = []
-    fetched = 0
-    offset = 0
-
-    while fetched < limit:
-        batch_size = min(50, limit - fetched)
-        params = {
-            "category": category,
-            "timePeriod": time_period,
-            "orderBy": "PNL",
-            "limit": batch_size,
-            "offset": offset,
-        }
-        try:
-            payload = request_with_retry(LEADERBOARD_V1_URL, params=params)
-        except Exception as e:
-            logs.append(f"Lỗi Leaderboard (offset={offset}): {e}")
-            break
-
-        data = payload.get("data") or payload.get("results") or [] if isinstance(payload, dict) else (payload or [])
-        if not data:
-            break
-
-        for idx_in_batch, item in enumerate(data):
-            if not isinstance(item, dict):
-                continue
-            w = str(
-                item.get("proxy_wallet")
-                or item.get("proxyWallet")
-                or item.get("user")
-                or item.get("address")
-                or ""
-            ).strip().lower()
-            if w.startswith("0x") and len(w) == 42:
-                rows.append({
-                    "lb_rank": offset + idx_in_batch + 1,
-                    "wallet": w,
-                    "userName": item.get("user_name") or item.get("userName") or item.get("name") or "",
-                    "lb_pnl": float(item.get("pnl") or 0),
-                    "lb_vol": float(item.get("vol") or item.get("volume") or 0),
-                })
-
-        fetched += len(data)
-        offset += batch_size
-        if len(data) < batch_size:
-            break
-
-    df = pd.DataFrame(rows).drop_duplicates(subset=["wallet"]).reset_index(drop=True) if rows else pd.DataFrame()
-    if not df.empty:
-        logs.append(f"Leaderboard ({category} / {time_period}): Kéo tự nhiên thành công **{len(df)}** ví.")
-    return (df["wallet"].tolist() if not df.empty else []), df, logs
 
 
 # ==============================================================================
@@ -321,14 +372,9 @@ def seed_wallets_from_leaderboard(category: str, time_period: str, limit: int) -
 # ==============================================================================
 
 def fast_surface_check(wallet: str, cfg: dict) -> tuple[bool, str, dict]:
-    """
-    Chặng 1 (~0.25s): Gọi các endpoint tổng hợp v2 (/user-stats, /user-volume, /user-pnl)
-    để loại ngay ví mới, bot MM quá lớn, hoặc ví âm/lãi quá mỏng trước khi kéo sổ chi tiết.
-    """
+    """Chặng 1 (~0.25s): Loại nhanh ví mới, bot MM quá rộng, hoặc Maker 99¢ biên lãi siêu mỏng."""
     w = wallet.strip().lower()
-    stats_data = {}
-    vol_data = {}
-    pnl_data = {}
+    stats_data, vol_data, pnl_data = {}, {}, {}
 
     try:
         r1 = request_with_retry(USER_STATS_V2_URL, {"user": w}, retries=2, timeout=8)
@@ -368,11 +414,10 @@ def fast_surface_check(wallet: str, cfg: dict) -> tuple[bool, str, dict]:
 
     meta = {"ui_markets": m_traded, "ui_vol": ui_vol, "ui_pnl": ui_pnl}
 
-    # Chỉ chặn sớm khi API trả về số liệu rõ ràng vi phạm ngưỡng (có vùng đệm an toàn 20%)
     if m_traded is not None and m_traded > 0:
         if m_traded < cfg["min_markets"] * 0.8:
             return False, f"⚡ Chặn sớm Tầng 1: Ít mẫu ({int(m_traded)} < {cfg['min_markets']} kèo)", meta
-        if m_traded > cfg["max_markets"] * 1.2:
+        if m_traded > cfg["max_markets"] * 1.25:
             return False, f"⚡ Chặn sớm Tầng 1: Đánh quá rộng ({int(m_traded)} > {cfg['max_markets']} kèo, nghi bot MM)", meta
 
     if ui_pnl is not None and ui_pnl < cfg["min_net_pnl"] * 0.7:
@@ -380,14 +425,13 @@ def fast_surface_check(wallet: str, cfg: dict) -> tuple[bool, str, dict]:
 
     if ui_pnl is not None and ui_vol is not None and ui_vol > 1000:
         surf_roi = (ui_pnl / ui_vol) * 100.0
-        # UI Volume tính 2 chiều nên surf_roi ~ 0.5 * True ROI; chặn nếu thấp hơn 35% mục tiêu
         if surf_roi < cfg["min_true_roi"] * 0.35:
-            return False, f"⚡ Chặn sớm Tầng 1: PnL/Volume bề mặt quá mỏng ({surf_roi:+.2f}%)", meta
+            return False, f"⚡ Chặn sớm Tầng 1: PnL/Volume bề mặt quá mỏng ({surf_roi:+.2f}% — nghi Maker 99¢)", meta
 
     return True, "", meta
 
 
-def fetch_positions_only_df(wallet: str, max_pages: int = 12) -> pd.DataFrame:
+def fetch_positions_only_df(wallet: str, max_pages: int = 20) -> pd.DataFrame:
     """Chặng 2A: Kéo 4 trạng thái từ /v2/positions và khử trùng lặp."""
     statuses = ["OPEN", "CLOSED", "REDEEMABLE", "REDEEMABLE_LOST"]
     raw_pos: list[dict] = []
@@ -441,8 +485,11 @@ def fetch_positions_only_df(wallet: str, max_pages: int = 12) -> pd.DataFrame:
     return pos_df
 
 
-def enrich_with_activity_df(wallet: str, pos_df: pd.DataFrame, max_pages: int = 12) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Chặng 2B: Kéo /v2/activity và ghép vốn mua thực 1 chiều + hành vi gom/thoát lệnh."""
+def enrich_with_activity_df(wallet: str, pos_df: pd.DataFrame, max_act_pages: int = 30) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Chặng 2B: Kéo sâu /v2/activity (tới 15,000 giao dịch gần nhất cho các ví ứng viên vượt qua Chặng 2A)
+    và khôi phục vốn mua chuẩn 1 chiều (kể cả các vị thế CLOSED cũ nằm ngoài cửa sổ activity).
+    """
     def get_col(df: pd.DataFrame, names: list[str], default=None) -> pd.Series:
         for n in names:
             if n in df.columns:
@@ -451,7 +498,7 @@ def enrich_with_activity_df(wallet: str, pos_df: pd.DataFrame, max_pages: int = 
 
     raw_act: list[dict] = []
     try:
-        raw_act = fetch_v2_paginated(ACTIVITY_V2_URL, wallet, {}, max_pages=max_pages)
+        raw_act = fetch_v2_paginated(ACTIVITY_V2_URL, wallet, {}, max_pages=max_act_pages)
     except Exception:
         raw_act = []
 
@@ -524,7 +571,18 @@ def enrich_with_activity_df(wallet: str, pos_df: pd.DataFrame, max_pages: int = 
         else:
             out_df[col] = default_v
 
-    out_df["true_cost"] = np.where(out_df["act_buy_usdc"] > 0, out_df["act_buy_usdc"], out_df["entry_cost_usdc"])
+    # Khôi phục vốn mua 1 chiều chuẩn:
+    # 1) Ưu tiên act_buy_usdc từ /v2/activity
+    # 2) Fallback entry_cost_usdc từ /v2/positions
+    # 3) Với các vị thế CLOSED cũ nằm ngoài cửa sổ activity (entry_cost_usdc == 0), ước tính ngược từ realized_pnl & avg_price
+    raw_cost = np.where(out_df["act_buy_usdc"] > 0, out_df["act_buy_usdc"], out_df["entry_cost_usdc"])
+    missing_mask = (raw_cost <= 0) & (out_df["avg_price"] > 0.005) & (out_df["avg_price"] < 0.995)
+    implied_cost = np.where(
+        out_df["realized_pnl"] > 0,
+        out_df["realized_pnl"] * out_df["avg_price"] / (1.0 - out_df["avg_price"]),
+        0.0,
+    )
+    out_df["true_cost"] = np.where(missing_mask, implied_cost, raw_cost)
     out_df["roi_pct"] = np.where(out_df["true_cost"] > 0, out_df["total_pnl"] / out_df["true_cost"] * 100.0, 0.0)
 
     cid_counts = out_df[out_df["condition_id"] != ""].groupby("condition_id")["outcome"].nunique()
@@ -584,21 +642,15 @@ def make_empty_summary(wallet: str, is_bench: bool, reason: str, markets: int = 
 def evaluate_wallet_pro(
     wallet: str,
     cfg: dict,
-    max_pages: int = 12,
+    max_pages: int = 20,
     is_benchmark_wallet: bool = False,
     fast_short_circuit: bool = True,
     cached_full_df: pd.DataFrame | None = None,
 ) -> tuple[dict, pd.DataFrame]:
-    """
-    Pipeline kiểm toán 3 chặng có ngắt mạch sớm (Short-Circuit):
-    1) Fast Surface Check (/user-stats, /user-volume, /user-pnl)
-    2) /v2/positions Check (chặn sớm nếu lệch số kèo, PnL, hoặc dải giá trước khi kéo /v2/activity)
-    3) Deep /v2/activity Audit (tính chính xác vốn 1 chiều, % REDEEM, Z-score, PnL ex-Top 5)
-    """
+    """Pipeline kiểm toán 3 chặng có ngắt mạch sớm cho ví nhiễu & kéo sâu activity cho ví ứng viên tiềm năng."""
     if cached_full_df is not None and not cached_full_df.empty and cached_full_df.get("_activity_enriched", pd.Series([False])).iloc[0]:
         pos_df = cached_full_df
     else:
-        # Chặng 1: Kiểm tra bề mặt siêu tốc
         if fast_short_circuit and not is_benchmark_wallet:
             ok_surf, reason_surf, meta_surf = fast_surface_check(wallet, cfg)
             if not ok_surf:
@@ -610,12 +662,10 @@ def evaluate_wallet_pro(
                     net_pnl=float(meta_surf["ui_pnl"] or 0.0),
                 ), pd.DataFrame()
 
-        # Chặng 2A: Kéo /v2/positions
         raw_pos_df = fetch_positions_only_df(wallet, max_pages=max_pages)
         if raw_pos_df.empty:
             return make_empty_summary(wallet, is_benchmark_wallet, "Ví không có lịch sử vị thế"), pd.DataFrame()
 
-        # Kiểm tra nhanh các điều kiện cứng trên /v2/positions trước khi gọi /v2/activity nặng
         if fast_short_circuit and not is_benchmark_wallet:
             n_mkt_pre = int(raw_pos_df["condition_id"].replace("", np.nan).nunique()) or len(raw_pos_df)
             pnl_pre = float(raw_pos_df["total_pnl"].sum())
@@ -640,7 +690,6 @@ def evaluate_wallet_pro(
                     markets=n_mkt_pre, net_pnl=pnl_pre, true_cost=cost_pre,
                 ), pd.DataFrame()
 
-            # Kiểm tra phân bổ dải giá theo số lượng / entry_cost trước khi kéo activity
             price_weights = np.where(raw_pos_df["entry_cost_usdc"] > 0, raw_pos_df["entry_cost_usdc"], 1.0)
             tot_w = float(np.sum(price_weights))
             fav_w = float(np.sum(price_weights[raw_pos_df["avg_price"] >= 0.95])) / tot_w * 100.0
@@ -651,8 +700,7 @@ def evaluate_wallet_pro(
                     markets=n_mkt_pre, net_pnl=pnl_pre, true_cost=cost_pre,
                 ), pd.DataFrame()
 
-        # Chặng 2B: Đã qua mọi chốt chặn -> Kéo /v2/activity đầy đủ
-        pos_df, _ = enrich_with_activity_df(wallet, raw_pos_df, max_pages=max_pages)
+        pos_df, _ = enrich_with_activity_df(wallet, raw_pos_df, max_act_pages=max(max_pages, 25))
 
     n_markets = int(pos_df["condition_id"].replace("", np.nan).nunique())
     if n_markets == 0:
@@ -663,14 +711,21 @@ def evaluate_wallet_pro(
     net_pnl = float(pos_df["total_pnl"].sum())
     true_roi = (net_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
 
+    cost_valid_df = pos_df[pos_df["true_cost"] > 0]
+    valid_cost_sum = float(cost_valid_df["true_cost"].sum())
+
     count_wr = float(pos_df["real_win"].mean() * 100.0)
-    cap_wr = float(pos_df.loc[pos_df["real_win"], "true_cost"].sum() / total_cost * 100.0) if total_cost > 0 else 0.0
-    w_entry = float((pos_df["avg_price"] * pos_df["true_cost"]).sum() / total_cost * 100.0) if total_cost > 0 else 0.0
+    if valid_cost_sum > 0:
+        cap_wr = float(cost_valid_df.loc[cost_valid_df["real_win"], "true_cost"].sum() / valid_cost_sum * 100.0)
+        w_entry = float((cost_valid_df["avg_price"] * cost_valid_df["true_cost"]).sum() / valid_cost_sum * 100.0)
+    else:
+        cap_wr = count_wr
+        w_entry = float(pos_df["avg_price"].mean() * 100.0)
     cap_edge = cap_wr - w_entry
 
-    if total_cost > 0 and n_pos >= 10:
-        weights = pos_df["true_cost"] / total_cost
-        probs = pos_df["avg_price"].clip(0.005, 0.995)
+    if valid_cost_sum > 0 and len(cost_valid_df) >= 10:
+        weights = cost_valid_df["true_cost"] / valid_cost_sum
+        probs = cost_valid_df["avg_price"].clip(0.005, 0.995)
         var_cap = float(np.sum((weights ** 2) * probs * (1.0 - probs)))
         z_score = ((cap_wr - w_entry) / 100.0) / math.sqrt(var_cap) if var_cap > 0 else 0.0
     else:
@@ -689,25 +744,28 @@ def evaluate_wallet_pro(
     else:
         hold_pnl_share = 0.0
 
-    core_band_cost = float(pos_df[(pos_df["avg_price"] >= 0.20) & (pos_df["avg_price"] <= 0.85)]["true_cost"].sum())
-    penny_cost = float(pos_df[pos_df["avg_price"] < 0.10]["true_cost"].sum())
-    high_fav_cost = float(pos_df[pos_df["avg_price"] >= 0.95]["true_cost"].sum())
+    core_band_cost = float(cost_valid_df[(cost_valid_df["avg_price"] >= 0.20) & (cost_valid_df["avg_price"] <= 0.85)]["true_cost"].sum())
+    penny_cost = float(cost_valid_df[cost_valid_df["avg_price"] < 0.10]["true_cost"].sum())
+    high_fav_cost = float(cost_valid_df[cost_valid_df["avg_price"] >= 0.95]["true_cost"].sum())
 
-    core_band_share = (core_band_cost / total_cost * 100.0) if total_cost > 0 else 0.0
-    penny_share = (penny_cost / total_cost * 100.0) if total_cost > 0 else 0.0
-    high_fav_share = (high_fav_cost / total_cost * 100.0) if total_cost > 0 else 0.0
+    core_band_share = (core_band_cost / valid_cost_sum * 100.0) if valid_cost_sum > 0 else 0.0
+    penny_share = (penny_cost / valid_cost_sum * 100.0) if valid_cost_sum > 0 else 0.0
+    high_fav_share = (high_fav_cost / valid_cost_sum * 100.0) if valid_cost_sum > 0 else 0.0
 
     top5_wins = float(pos_df[pos_df["total_pnl"] > 0].sort_values("total_pnl", ascending=False)["total_pnl"].head(5).sum())
     pnl_ex_top5 = net_pnl - top5_wins
 
-    q80 = pos_df["true_cost"].quantile(0.80)
-    q50 = pos_df["true_cost"].quantile(0.50)
-    top20_df = pos_df[pos_df["true_cost"] >= q80]
-    bot50_df = pos_df[pos_df["true_cost"] <= q50]
-    top20_roi = (top20_df["total_pnl"].sum() / top20_df["true_cost"].sum() * 100.0) if top20_df["true_cost"].sum() > 0 else 0.0
-    bot50_roi = (bot50_df["total_pnl"].sum() / bot50_df["true_cost"].sum() * 100.0) if bot50_df["true_cost"].sum() > 0 else 0.0
+    if not cost_valid_df.empty:
+        q80 = cost_valid_df["true_cost"].quantile(0.80)
+        q50 = cost_valid_df["true_cost"].quantile(0.50)
+        top20_df = cost_valid_df[cost_valid_df["true_cost"] >= q80]
+        bot50_df = cost_valid_df[cost_valid_df["true_cost"] <= q50]
+        top20_roi = (top20_df["total_pnl"].sum() / top20_df["true_cost"].sum() * 100.0) if top20_df["true_cost"].sum() > 0 else 0.0
+        bot50_roi = (bot50_df["total_pnl"].sum() / bot50_df["true_cost"].sum() * 100.0) if bot50_df["true_cost"].sum() > 0 else 0.0
+        med_size = float(cost_valid_df["true_cost"].median())
+    else:
+        top20_roi, bot50_roi, med_size = 0.0, 0.0, 0.0
 
-    med_size = float(pos_df["true_cost"].median())
     med_accum_h = float(pos_df["accum_hours"].median())
     med_hold_h = float(pos_df["hold_hours"].median())
     hedged_pct = float(pos_df["is_hedged"].mean() * 100.0)
@@ -822,31 +880,30 @@ def evaluate_wallet_pro(
 
 
 # ==============================================================================
-# 4. STREAMLIT UI
+# 4. STREAMLIT UI (LEADERBOARD-FIRST ENGINE)
 # ==============================================================================
 
-st.title("🎯 Trạm Săn & Kiểm Toán Ví Pro Polymarket (Tăng Tốc Đa Luồng)")
+st.title("🏆 Trạm Săn & Kiểm Toán Ví Pro Polymarket (Leaderboard v2 Engine)")
 st.caption(
-    "Tích hợp **Kiểm toán 3 chặng ngắt mạch sớm** (`User Stats -> Positions -> Activity`) + **6 luồng song song** "
-    "và **Cache phiên làm việc**, rút ngắn thời gian quét 26–50 ví từ vài phút xuống còn vài giây."
+    "Ưu tiên đào từ **Leaderboard Data API v2 (`/v2/leaderboard` + `/v2/biggest-winners`)** để bắt trọn các ví gom lệnh "
+    "pre-event có PnL tích lũy cao (như ví CS2 mẫu), sau đó sàng lọc 3 chặng để loại bỏ bẫy Maker 99¢ và Scalper bán sớm."
 )
 
 with st.sidebar:
     st.header("🎯 1. Ví Mẫu Kiểm Định (Canary)")
     ref_wallet_input = st.text_input(
-        "Địa chỉ Ví Mẫu dùng kiểm tra độ phủ Seeding",
+        "Địa chỉ Ví Mẫu dùng kiểm tra độ phủ Leaderboard",
         value=DEFAULT_BENCHMARK_WALLET,
     ).strip().lower()
 
     st.divider()
-    st.header("⚡ 2. Tốc độ & Độ sâu Quét")
+    st.header("⚡ 2. Tốc độ & Độ sâu Sổ cái")
     c_spd1, c_spd2 = st.columns(2)
-    max_api_pages = c_spd1.number_input("Số trang API (×500)", min_value=3, max_value=40, value=12, step=3)
-    num_workers = c_spd2.number_input("Số luồng song song", min_value=2, max_value=10, value=6, step=1)
+    max_api_pages = c_spd1.number_input("Trang /positions (×500)", min_value=5, max_value=40, value=15, step=5)
+    num_workers = c_spd2.number_input("Luồng song song", min_value=2, max_value=10, value=6, step=1)
     fast_mode = st.checkbox(
         "Chặn sớm 3 chặng (Bỏ qua /activity với ví rớt ngưỡng)",
         value=True,
-        help="Tăng tốc gấp 10x bằng cách không tải lịch sử activity nặng cho các ví đã rớt số kèo, PnL hoặc dải giá.",
     )
 
     st.divider()
@@ -886,44 +943,37 @@ for key, default_val in [
     if key not in st.session_state:
         st.session_state[key] = default_val
 
-tab_scan, tab_xray = st.tabs(["🔍 1. Đào Tự Nhiên & Sàng Lọc Ví Pro", "🔬 2. Soi Sâu Từng Ví (X-Ray & Xuất CSV)"])
+tab_scan, tab_xray = st.tabs(["🏆 1. Đào từ Leaderboard & Sàng Lọc", "🔬 2. Soi Sâu Từng Ví (X-Ray & Xuất CSV)"])
 
 with tab_scan:
     seed_mode = st.radio(
-        "Chọn nguồn thu thập ví hạt giống tự nhiên:",
+        "Chọn nguồn thu thập ví hạt giống:",
         options=[
-            "Nguồn A: Đào từ Market thanh khoản cao (Gom đa clip trên /v2/trades)",
-            "Nguồn B: Kéo từ Bảng Xếp Hạng (Leaderboard Polymarket)",
-            "Nguồn C: Nhập danh sách ví thủ công / Upload CSV",
+            "Nguồn 1 (Khuyên dùng): Đào từ Leaderboard v2 (/v2/leaderboard)",
+            "Nguồn 2: Nhập danh sách ví thủ công / Upload CSV",
+            "Nguồn 3: Đào từ Market thanh khoản cao (/v2/trades)",
         ],
         horizontal=True,
     )
 
     manual_candidates: list[str] = []
 
-    if seed_mode.startswith("Nguồn A"):
-        col_a1, col_a2, col_a3, col_a4 = st.columns([2.2, 1, 1.1, 1])
-        cat_choice = col_a1.selectbox(
-            "Nhóm thị trường mục tiêu",
-            [
-                "Esports (CS2 / Dota / LoL / Valorant)",
-                "Sports Truyền Thống (NBA / Tennis / Bóng đá / UFC)",
-                "Tất cả Sports & Esports",
-                "Finance (Chỉ số / Cổ phiếu / Vàng / Lãi suất)",
-                "Politics & Macro",
-            ],
+    if seed_mode.startswith("Nguồn 1"):
+        col_b1, col_b2, col_b3, col_b4 = st.columns([2, 1.5, 1, 1])
+        lb_cats = col_b1.multiselect(
+            "Category Leaderboard (có thể chọn nhiều)",
+            options=["SPORTS", "FINANCE", "POLITICS", "ECONOMICS", "TECH", "OVERALL"],
+            default=["SPORTS", "FINANCE"],
         )
-        n_mkts = col_a2.number_input("Số trận quét", 5, 80, 30, 5)
-        min_accum_trd = col_a3.number_input("Tổng gom tối thiểu / trận ($)", 50, 20000, 1000, 100)
-        max_cand_a = col_a4.number_input("Top N ví kiểm toán", 5, 100, 30, 5)
+        lb_periods = col_b2.multiselect(
+            "Khung thời gian (time_period)",
+            options=["all", "month", "week"],
+            default=["all", "month"],
+        )
+        lb_limit = col_b3.number_input("Top N ví / bảng", 25, 250, 100, 25)
+        inc_bw = col_b4.checkbox("Gộp thêm Biggest Winners", value=True)
 
-    elif seed_mode.startswith("Nguồn B"):
-        col_b1, col_b2, col_b3 = st.columns([2, 1, 1])
-        lb_cat = col_b1.selectbox("Category Leaderboard", ["SPORTS", "OVERALL", "FINANCE", "POLITICS"])
-        lb_period = col_b2.selectbox("Khung thời gian", ["ALL", "MONTH", "WEEK"])
-        lb_limit = col_b3.number_input("Độ sâu kéo Top N ví", 20, 200, 100, 20)
-
-    else:
+    elif seed_mode.startswith("Nguồn 2"):
         raw_text = st.text_area(
             "Dán danh sách địa chỉ ví `0x...` cần kiểm tra:",
             value="",
@@ -942,8 +992,22 @@ with tab_scan:
 
         manual_candidates = list(dict.fromkeys(w.lower() for w in parsed_wallets))
 
+    else:
+        col_a1, col_a2, col_a3, col_a4 = st.columns([2.2, 1, 1.1, 1])
+        cat_choice = col_a1.selectbox(
+            "Nhóm thị trường mục tiêu",
+            [
+                "Esports (CS2 / Dota / LoL / Valorant)",
+                "Sports Truyền Thống (NBA / Tennis / Bóng đá / UFC)",
+                "Finance (Chỉ số / Cổ phiếu / Vàng / Lãi suất)",
+            ],
+        )
+        n_mkts = col_a2.number_input("Số trận quét", 5, 80, 30, 5)
+        min_accum_trd = col_a3.number_input("Tổng gom tối thiểu / trận ($)", 50, 20000, 1000, 100)
+        max_cand_a = col_a4.number_input("Top N ví kiểm toán", 5, 100, 30, 5)
+
     run_scan_clicked = st.button(
-        "🚀 THU THẬP HẠT GIỐNG TỰ NHIÊN & CHẠY SÀNG LỌC",
+        "🚀 ĐÀO TỪ LEADERBOARD & CHẠY KIỂM TOÁN 3 CHẶNG",
         type="primary",
         use_container_width=True,
     )
@@ -951,42 +1015,45 @@ with tab_scan:
     if run_scan_clicked:
         t0 = time.perf_counter()
 
-        if seed_mode.startswith("Nguồn A"):
-            with st.spinner("Đang quét song song Gamma API & Data API /v2/trades..."):
-                raw_seeded, seed_df, logs = seed_wallets_from_markets(cat_choice, int(n_mkts), float(min_accum_trd))
-                cand_list = raw_seeded[: int(max_cand_a)]
-                st.session_state["seed_preview"] = seed_df
-                st.session_state["seed_logs"] = logs
-        elif seed_mode.startswith("Nguồn B"):
-            with st.spinner("Đang kéo dữ liệu Leaderboard Polymarket..."):
-                raw_seeded, seed_df, logs = seed_wallets_from_leaderboard(lb_cat, lb_period, int(lb_limit))
-                cand_list = raw_seeded
-                st.session_state["seed_preview"] = seed_df
-                st.session_state["seed_logs"] = logs
-        else:
+        if seed_mode.startswith("Nguồn 1"):
+            if not lb_cats or not lb_periods:
+                st.warning("Vui lòng chọn ít nhất 1 Category và 1 khung thời gian.")
+                cand_list, raw_seeded = [], []
+            else:
+                with st.spinner("Đang kéo danh sách ví từ Polymarket Leaderboard v2 (cursor pagination)..."):
+                    raw_seeded, seed_df, logs = seed_wallets_from_leaderboard_multi(
+                        lb_cats, lb_periods, int(lb_limit), include_biggest_winners=bool(inc_bw)
+                    )
+                    cand_list = raw_seeded
+                    st.session_state["seed_preview"] = seed_df
+                    st.session_state["seed_logs"] = logs
+        elif seed_mode.startswith("Nguồn 2"):
             raw_seeded = manual_candidates
             cand_list = manual_candidates
             st.session_state["seed_preview"] = pd.DataFrame()
             st.session_state["seed_logs"] = [f"Nguồn thủ công: Nhận **{len(cand_list)}** địa chỉ ví."]
-
-        if ref_wallet_input in raw_seeded:
-            rank_in_seed = raw_seeded.index(ref_wallet_input) + 1
-            in_audit_slice = ref_wallet_input in cand_list
-            st.session_state["canary_status"] = (
-                "FOUND",
-                f"🎯 **SEEDING TỰ NHIÊN ĐÃ BẮT TRÚNG VÍ MẪU:** `{ref_wallet_input}` xuất hiện tự nhiên ở **hạng #{rank_in_seed}/{len(raw_seeded)}** "
-                + ("và sẽ tự đi qua các tầng kiểm toán bên dưới." if in_audit_slice else f"(nằm ngoài Top {len(cand_list)} cắt vào kiểm toán)."),
-            )
         else:
-            st.session_state["canary_status"] = (
-                "NOT_FOUND",
-                f"ℹ️ **Ví Mẫu `{ref_wallet_input[:10]}...` không có mặt trong tập hạt giống vừa thu thập tự nhiên** "
-                "(do khác category mục tiêu hoặc chưa phát sinh giao dịch mới trong lô trận vừa quét).",
-            )
+            with st.spinner("Đang quét sổ lệnh Gamma API & /v2/trades..."):
+                raw_seeded, seed_df, logs = seed_wallets_from_markets(cat_choice, int(n_mkts), float(min_accum_trd))
+                cand_list = raw_seeded[: int(max_cand_a)]
+                st.session_state["seed_preview"] = seed_df
+                st.session_state["seed_logs"] = logs
 
-        if not cand_list:
-            st.warning("⚠️ Bộ thu thập tự nhiên trả về 0 ví. Hãy giảm ngưỡng 'Tổng gom tối thiểu / trận ($)' hoặc tăng độ sâu quét.")
-        else:
+        if cand_list:
+            if ref_wallet_input in raw_seeded:
+                rank_in_seed = raw_seeded.index(ref_wallet_input) + 1
+                st.session_state["canary_status"] = (
+                    "FOUND",
+                    f"🎯 **ĐÃ BẮT TRÚNG VÍ MẪU TRÊN LEADERBOARD:** `{ref_wallet_input}` xuất hiện tự nhiên ở **vị trí #{rank_in_seed}/{len(raw_seeded)}** "
+                    "và đang tự đi qua các tầng kiểm toán bên dưới!",
+                )
+            else:
+                st.session_state["canary_status"] = (
+                    "NOT_FOUND",
+                    f"ℹ️ **Ví Mẫu `{ref_wallet_input[:10]}...` chưa nằm trong danh sách vừa kéo** "
+                    "(nếu đang quét `SPORTS / all`, hãy tăng 'Top N ví / bảng' lên `150–200` để chạm tới đúng thứ hạng của ví mẫu).",
+                )
+
             results = []
             details_map = dict(st.session_state["audit_details"])
             prog = st.progress(0.0, text=f"Đang kiểm toán song song {len(cand_list)} ví trên {int(num_workers)} luồng...")
@@ -1042,7 +1109,7 @@ with tab_scan:
             st.info(msg)
 
     if not st.session_state["seed_preview"].empty:
-        with st.expander(f"📋 Xem danh sách {len(st.session_state['seed_preview'])} ví hạt giống thu thập tự nhiên ở Tầng 0", expanded=False):
+        with st.expander(f"📋 Xem danh sách {len(st.session_state['seed_preview'])} ví thu thập từ Leaderboard ở Tầng 0", expanded=False):
             st.dataframe(st.session_state["seed_preview"], use_container_width=True, hide_index=True)
 
     res_df = st.session_state["audit_results"]
@@ -1093,9 +1160,9 @@ with tab_scan:
 
         csv_out = res_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
-            "📥 Tải kết quả sàng lọc tự nhiên (CSV)",
+            "📥 Tải kết quả sàng lọc Leaderboard (CSV)",
             data=csv_out,
-            file_name=f"polymarket_organic_pro_wallets_{datetime.now(VN_TZ).strftime('%Y%m%d_%H%M')}.csv",
+            file_name=f"polymarket_leaderboard_pro_wallets_{datetime.now(VN_TZ).strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
         )
 
@@ -1123,7 +1190,7 @@ with tab_xray:
     if st.button("🔬 Phân tích X-Ray đầy đủ ví này (Bỏ qua ngắt mạch sớm)", use_container_width=True) and target_xray.startswith("0x"):
         with st.spinner(f"Đang giải phẫu toàn bộ sổ cái của `{target_xray}`..."):
             _, df_one = evaluate_wallet_pro(
-                target_xray, cfg=cfg, max_pages=max(int(max_api_pages), 20), fast_short_circuit=False
+                target_xray, cfg=cfg, max_pages=max(int(max_api_pages), 25), fast_short_circuit=False
             )
             if not df_one.empty:
                 st.session_state["audit_details"][target_xray] = df_one
