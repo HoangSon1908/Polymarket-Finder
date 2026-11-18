@@ -1,5 +1,4 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
 import math
 import re
 import threading
@@ -13,7 +12,7 @@ from requests.adapters import HTTPAdapter
 import streamlit as st
 
 st.set_page_config(
-    page_title="Polymarket Wallet Finder — Step 1 & Step 2",
+    page_title="Polymarket Wallet Finder — Kiểm Toán Bước 2",
     page_icon="📡",
     layout="wide",
 )
@@ -26,7 +25,6 @@ LEADERBOARD_V2_URL = "https://data-api.polymarket.com/v2/leaderboard"
 LEADERBOARD_V1_URL = "https://data-api.polymarket.com/v1/leaderboard"
 POSITIONS_V2_URL = "https://data-api.polymarket.com/v2/positions"
 ACTIVITY_V2_URL = "https://data-api.polymarket.com/v2/activity"
-USER_STATS_V2_URL = "https://data-api.polymarket.com/v2/user-stats"
 
 VN_TZ = timezone(timedelta(hours=7))
 EVM_ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
@@ -65,7 +63,7 @@ def get_http_session() -> requests.Session:
         sess.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "Polymarket-Wallet-Finder/2.0",
+                "User-Agent": "Polymarket-Wallet-Finder/2.3",
             }
         )
         _THREAD_LOCAL.session = sess
@@ -161,7 +159,7 @@ def _parse_timestamp_utc(raw_ts: Any) -> datetime | None:
         ts_val = float(raw_ts)
         if ts_val <= 0:
             return None
-        if ts_val > 1e12:  # milliseconds
+        if ts_val > 1e12:
             ts_val /= 1000.0
         try:
             return datetime.fromtimestamp(ts_val, tz=timezone.utc)
@@ -180,8 +178,58 @@ def _parse_timestamp_utc(raw_ts: Any) -> datetime | None:
     return None
 
 
+def _fetch_positions_by_status(
+    wallet: str,
+    status_val: str,
+    max_pages: int = 8,
+    stop_cid_cap: int | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Kéo danh sách vị thế theo đúng status trên Data API v2 (cursor pagination)."""
+    rows: list[dict[str, Any]] = []
+    unique_cids: set[str] = set()
+    cursor: str | None = None
+    capped = False
+
+    for _ in range(max_pages):
+        params: dict[str, Any] = {"user": wallet, "status": status_val, "limit": 500}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            payload = request_json_with_retry(POSITIONS_V2_URL, params=params, retries=2, timeout=10)
+        except Exception:
+            break
+
+        if isinstance(payload, dict):
+            batch = payload.get("data") or []
+            pagination = payload.get("pagination") or {}
+            cursor = pagination.get("next_cursor")
+            has_more = bool(pagination.get("has_more", bool(cursor)))
+        elif isinstance(payload, list):
+            batch = payload
+            cursor = None
+            has_more = False
+        else:
+            break
+
+        for r in batch:
+            if not isinstance(r, dict):
+                continue
+            rows.append(r)
+            cid = str(r.get("condition_id") or r.get("conditionId") or "").strip()
+            if cid:
+                unique_cids.add(cid)
+
+        if stop_cid_cap is not None and len(unique_cids) > stop_cid_cap:
+            capped = True
+            break
+        if not cursor or not has_more:
+            break
+
+    return rows, capped
+
+
 # ==============================================================================
-# BƯỚC 1 (ĐÃ TRIỂN KHAI): THU THẬP DỮ LIỆU THÔ TOP N VÍ TỪ LEADERBOARD
+# BƯỚC 1 (HOÀN THÀNH): THU THẬP DỮ LIỆU THÔ TOP N VÍ TỪ LEADERBOARD
 # ==============================================================================
 
 def step1_fetch_leaderboard(
@@ -351,28 +399,27 @@ def step1_fetch_leaderboard(
 
 
 # ==============================================================================
-# BƯỚC 2 (ĐÃ TRIỂN KHAI): LỌC BỀ MẶT, ĐỘ TƯƠI & QUY MÔ MẪU (FAST REJECT GATE)
+# BƯỚC 2 (ĐANG KIỂM TOÁN): LỌC BỀ MẶT, CHẶN XÁC VỊ THẾ (0¢) & KHÓA ĐỘ TƯƠI
 # ==============================================================================
 
-def _probe_wallet_surface_v2(wallet: str, max_markets_cap: int) -> dict[str, Any]:
+def _probe_wallet_surface_v2(wallet: str, max_settled_cap: int) -> dict[str, Any]:
     """
-    Kiểm tra nhanh 1 ví qua Data API v2:
-      1. Độ tươi: Giao dịch gần nhất (days_since_last_act) & có vị thế OPEN hay không.
-      2. Quy mô mẫu: Số lượng market (condition_id) đã tham gia (ngắt sớm nếu > max_markets_cap).
-      3. Ngách gần nhất: Tiêu đề kèo gần nhất của ví.
+    Thăm dò chuẩn xác 1 ví qua Data API v2:
+      1. Activity (/v2/activity?limit=100): Độ tươi (days_since_last), số kèo hoạt động 30d qua.
+      2. OPEN (/v2/positions?status=OPEN): Tách riêng lệnh OPEN đang sống vs "xác vị thế" về giá 0¢.
+      3. SETTLED (/v2/positions?status=CLOSED + REDEEMABLE + REDEEMABLE_LOST): Đếm đúng số kèo đã đánh.
     """
     now_utc = datetime.now(timezone.utc)
-    days_since_last: float | None = None
-    last_act_vn = "N/A"
-    recent_market_title = ""
-    has_open_pos = False
-    markets_count: int | None = None
-    markets_capped = False
+    cutoff_30d = now_utc - timedelta(days=30)
 
-    # 1. Kiểm tra hoạt động gần nhất (/v2/activity?user=...&limit=5)
+    days_since_last: float | None = None
+    recent_market_title = ""
+    recent_30d_cids: set[str] = set()
+
+    # 1. Kiểm tra lịch sử hoạt động gần nhất (/v2/activity?user=...&limit=100)
     try:
         act_payload = request_json_with_retry(
-            ACTIVITY_V2_URL, params={"user": wallet, "limit": 5}, retries=2, timeout=10
+            ACTIVITY_V2_URL, params={"user": wallet, "limit": 100}, retries=2, timeout=10
         )
         act_rows = act_payload.get("data") or [] if isinstance(act_payload, dict) else (act_payload or [])
         latest_dt: datetime | None = None
@@ -382,97 +429,70 @@ def _probe_wallet_surface_v2(wallet: str, max_markets_cap: int) -> dict[str, Any
             if not recent_market_title:
                 recent_market_title = str(r.get("title") or r.get("question") or "").strip()
             dt = _parse_timestamp_utc(r.get("timestamp") or r.get("created_at") or r.get("time"))
-            if dt and (latest_dt is None or dt > latest_dt):
-                latest_dt = dt
+            if dt:
+                if latest_dt is None or dt > latest_dt:
+                    latest_dt = dt
+                if dt >= cutoff_30d:
+                    cid = str(r.get("condition_id") or r.get("conditionId") or r.get("market") or "").strip()
+                    if cid:
+                        recent_30d_cids.add(cid)
         if latest_dt is not None:
             days_since_last = max(0.0, (now_utc - latest_dt).total_seconds() / 86400.0)
-            last_act_vn = latest_dt.astimezone(VN_TZ).strftime("%d/%m/%Y %H:%M")
     except Exception:
         pass
 
-    # 2. Kiểm tra vị thế đang mở (/v2/positions?user=...&status=OPEN&limit=1)
-    try:
-        open_payload = request_json_with_retry(
-            POSITIONS_V2_URL, params={"user": wallet, "status": "OPEN", "limit": 1}, retries=2, timeout=10
-        )
-        open_rows = open_payload.get("data") or [] if isinstance(open_payload, dict) else (open_payload or [])
-        if len(open_rows) > 0:
-            has_open_pos = True
-            if not recent_market_title and isinstance(open_rows[0], dict):
-                recent_market_title = str(open_rows[0].get("title") or "").strip()
-    except Exception:
-        pass
+    # 2. Kiểm tra vị thế đang mở (status=OPEN): tách lệnh sống vs "xác vị thế" về giá 0¢
+    open_rows, open_capped = _fetch_positions_by_status(wallet, "OPEN", max_pages=2, stop_cid_cap=500)
+    live_open_cnt = 0
+    dead_zero_open_cnt = 0
 
-    # 3. Lấy số lượng market đã tham gia (Ưu tiên /v2/user-stats, fallback đếm unique condition_id qua /v2/positions)
-    try:
-        stats_payload = request_json_with_retry(
-            USER_STATS_V2_URL, params={"user": wallet}, retries=1, timeout=8
-        )
-        stats_obj = (
-            stats_payload.get("data")
-            if isinstance(stats_payload, dict) and isinstance(stats_payload.get("data"), dict)
-            else stats_payload
-        )
-        if isinstance(stats_obj, dict):
-            for k in ("markets_traded", "marketsTraded", "total_markets", "totalMarkets", "markets", "num_markets"):
-                val = stats_obj.get(k)
-                if val is not None and not isinstance(val, (dict, list, bool)):
-                    try:
-                        markets_count = int(float(val))
-                        break
-                    except (ValueError, TypeError):
-                        continue
-    except Exception:
-        pass
+    for r in open_rows:
+        cur_p = _pick_first_float(r, ("current_price", "curPrice", "price"), 0.0)
+        cur_v = _pick_first_float(r, ("current_value", "currentValue"), 0.0)
+        cur_s = _pick_first_float(r, ("current_size", "size"), 0.0)
+        if not recent_market_title:
+            recent_market_title = str(r.get("title") or "").strip()
 
-    # Fallback chính xác bằng cursor /v2/positions (ngắt sớm ngay khi vượt max_markets_cap)
-    if markets_count is None:
-        unique_cids: set[str] = set()
-        cursor: str | None = None
-        for _ in range(5):  # Tối đa 5 trang x 500 = 2,500 vị thế
-            params: dict[str, Any] = {"user": wallet, "limit": 500}
-            if cursor:
-                params["cursor"] = cursor
-            try:
-                pos_payload = request_json_with_retry(POSITIONS_V2_URL, params=params, retries=2, timeout=10)
-            except Exception:
-                break
+        if cur_p <= 0.01 and cur_v <= 0.5:
+            dead_zero_open_cnt += 1
+        elif cur_v > 1.0 or (0.01 < cur_p < 0.99 and cur_s > 0):
+            live_open_cnt += 1
+        else:
+            dead_zero_open_cnt += 1
 
-            if isinstance(pos_payload, dict):
-                batch = pos_payload.get("data") or []
-                pagination = pos_payload.get("pagination") or {}
-                cursor = pagination.get("next_cursor")
-                has_more = bool(pagination.get("has_more", bool(cursor)))
-            elif isinstance(pos_payload, list):
-                batch = pos_payload
-                cursor = None
-                has_more = False
-            else:
-                break
+    # 3. Đếm số kèo đã giao dịch & ngã ngũ (CLOSED + REDEEMABLE + REDEEMABLE_LOST)
+    settled_cids: set[str] = set()
+    max_pages_closed = max(2, math.ceil((max_settled_cap + 200) / 500))
+    closed_rows, settled_capped = _fetch_positions_by_status(
+        wallet, "CLOSED", max_pages=max_pages_closed, stop_cid_cap=max_settled_cap
+    )
+    for r in closed_rows:
+        cid = str(r.get("condition_id") or r.get("conditionId") or "").strip()
+        if cid:
+            settled_cids.add(cid)
+        if not recent_market_title:
+            recent_market_title = str(r.get("title") or "").strip()
 
-            for row in batch:
-                if not isinstance(row, dict):
-                    continue
-                cid = str(row.get("condition_id") or row.get("conditionId") or "").strip()
+    if not settled_capped:
+        for extra_st in ("REDEEMABLE", "REDEEMABLE_LOST"):
+            extra_rows, _ = _fetch_positions_by_status(wallet, extra_st, max_pages=2, stop_cid_cap=500)
+            for r in extra_rows:
+                cid = str(r.get("condition_id") or r.get("conditionId") or "").strip()
                 if cid:
-                    unique_cids.add(cid)
-                if not recent_market_title:
-                    recent_market_title = str(row.get("title") or "").strip()
+                    settled_cids.add(cid)
 
-            if len(unique_cids) > max_markets_cap:
-                markets_capped = True
-                break
-            if not cursor or not has_more:
-                break
-
-        markets_count = len(unique_cids)
+    settled_count = len(settled_cids)
+    if settled_count > max_settled_cap:
+        settled_capped = True
 
     return {
-        "markets_count": markets_count,
-        "markets_capped": markets_capped,
+        "settled_markets": settled_count,
+        "settled_capped": settled_capped,
+        "live_open": live_open_cnt,
+        "dead_zero_open": dead_zero_open_cnt,
+        "open_capped": open_capped,
+        "recent_30d_mkts": len(recent_30d_cids),
         "days_since_last": round(days_since_last, 1) if days_since_last is not None else None,
-        "last_act_vn": last_act_vn,
-        "has_open_pos": has_open_pos,
         "recent_market": recent_market_title[:75] if recent_market_title else "N/A",
     }
 
@@ -481,10 +501,6 @@ def step2_surface_filter(
     df: pd.DataFrame,
     cfg: dict[str, Any],
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """
-    Tầng 2: Sàng lọc bề mặt tốc độ cao (0ms lọc chỉ số bảng + 8 luồng thăm dò độ tươi & số kèo).
-    Trả về: (df_passed, df_annotated_all, stats_log).
-    """
     t0 = time.perf_counter()
     if df.empty:
         return df.copy(), df.copy(), {"elapsed_s": 0.0, "input_count": 0, "passed_count": 0}
@@ -495,9 +511,9 @@ def step2_surface_filter(
     min_mkts = int(cfg["min_markets"])
     max_mkts = int(cfg["max_markets"])
     max_inactive_days = float(cfg["max_inactive_days"])
-    allow_open_override = bool(cfg["allow_open_override"])
+    max_dead_open = int(cfg["max_dead_open"])
+    allow_live_open_override = bool(cfg["allow_live_open_override"])
 
-    # Chốt 1 (0ms): Đánh giá chỉ số bề mặt có sẵn từ Bước 1
     pre_pass_wallets: list[str] = []
     pre_fail_reasons: dict[str, list[str]] = {}
 
@@ -516,7 +532,6 @@ def step2_surface_filter(
         else:
             pre_pass_wallets.append(w)
 
-    # Chốt 2 & 3 (Song song 8 luồng): Chỉ gọi API thăm dò cho nhóm đã qua Chốt 1
     probe_map: dict[str, dict[str, Any]] = {}
     if pre_pass_wallets:
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -530,20 +545,22 @@ def step2_surface_filter(
                     probe_map[w] = fut.result()
                 except Exception as exc:
                     probe_map[w] = {
-                        "markets_count": 0,
-                        "markets_capped": False,
+                        "settled_markets": 0,
+                        "settled_capped": False,
+                        "live_open": 0,
+                        "dead_zero_open": 0,
+                        "open_capped": False,
+                        "recent_30d_mkts": 0,
                         "days_since_last": None,
-                        "last_act_vn": "Lỗi API",
-                        "has_open_pos": False,
                         "recent_market": f"Lỗi: {exc}",
                     }
 
-    # Tổng hợp kết quả đánh giá cho toàn bộ bảng
     status_col: list[str] = []
     passed_flags: list[bool] = []
-    mkts_col: list[str] = []
+    settled_col: list[str] = []
+    open_summary_col: list[str] = []
+    recent_30d_col: list[str] = []
     fresh_col: list[str] = []
-    open_col: list[bool] = []
     recent_col: list[str] = []
     reason_col: list[str] = []
 
@@ -552,63 +569,71 @@ def step2_surface_filter(
         if w in pre_fail_reasons:
             passed_flags.append(False)
             status_col.append("❌ LOẠI (Bề mặt)")
-            mkts_col.append("—")
+            settled_col.append("—")
+            open_summary_col.append("—")
+            recent_30d_col.append("—")
             fresh_col.append("—")
-            open_col.append(False)
             recent_col.append("Bỏ qua gọi API (rớt P/V hoặc PnL)")
             reason_col.append(" | ".join(pre_fail_reasons[w]))
             continue
 
         info = probe_map.get(w, {})
-        m_cnt = info.get("markets_count")
-        m_capped = bool(info.get("markets_capped", False))
+        m_cnt = int(info.get("settled_markets") or 0)
+        m_capped = bool(info.get("settled_capped", False))
+        live_open = int(info.get("live_open") or 0)
+        dead_open = int(info.get("dead_zero_open") or 0)
+        open_capped = bool(info.get("open_capped", False))
+        r30_cnt = int(info.get("recent_30d_mkts") or 0)
         d_last = info.get("days_since_last")
-        has_open = bool(info.get("has_open_pos", False))
 
         reasons = []
-        # Kiểm tra số lượng kèo
-        if m_cnt is None or m_cnt == 0:
-            reasons.append("Không đọc được số kèo")
-        elif m_cnt < min_mkts:
-            reasons.append(f"Ít mẫu ({m_cnt} < {min_mkts} kèo)")
+        if m_cnt < min_mkts:
+            reasons.append(f"Ít mẫu đã đóng ({m_cnt} < {min_mkts} kèo)")
         elif m_capped or m_cnt > max_mkts:
-            reasons.append(f"Đánh quá rộng (> {max_mkts} kèo)")
+            reasons.append(f"Quá trần kèo đã đóng (>{max_mkts})")
 
-        # Kiểm tra độ tươi (còn đang chạy hay đã ngừng)
+        if open_capped or dead_open > max_dead_open:
+            dead_disp = f">{max_dead_open}" if open_capped else str(dead_open)
+            reasons.append(f"Ôm xác vị thế về 0 ({dead_disp} lệnh $0 > {max_dead_open})")
+
         is_fresh = False
         if d_last is not None and d_last <= max_inactive_days:
             is_fresh = True
-        elif allow_open_override and has_open:
+        elif allow_live_open_override and live_open > 0:
             is_fresh = True
 
         if not is_fresh:
             if d_last is None:
                 reasons.append("Không có dấu vết hoạt động gần đây")
             else:
-                reasons.append(f"Ngừng chạy ({d_last:.0f} ngày trước > {max_inactive_days:.0f}d)")
+                reasons.append(f"Ngừng chạy ({d_last:.0f}d trước > {max_inactive_days:.0f}d)")
 
-        mkts_str = f">{max_mkts}" if m_capped else (str(m_cnt) if m_cnt is not None else "N/A")
+        settled_str = f">{max_mkts}" if m_capped else str(m_cnt)
+        dead_lbl = f"{dead_open}+" if open_capped else str(dead_open)
+        open_str = f"{live_open} sống / {dead_lbl} xác 0¢"
         fresh_str = f"{d_last:.1f}d trước" if d_last is not None else "Không rõ"
 
-        mkts_col.append(mkts_str)
+        settled_col.append(settled_str)
+        open_summary_col.append(open_str)
+        recent_30d_col.append(f"{r30_cnt} kèo" if r30_cnt > 0 else "0 kèo")
         fresh_col.append(fresh_str)
-        open_col.append(has_open)
         recent_col.append(str(info.get("recent_market") or "N/A"))
 
         if not reasons:
             passed_flags.append(True)
             status_col.append("✅ ĐẠT BƯỚC 2")
-            reason_col.append("Đạt P/V, đủ mẫu kèo & đang hoạt động")
+            reason_col.append("Sạch xác vị thế, đủ kèo & đang chạy")
         else:
             passed_flags.append(False)
-            status_col.append("❌ LOẠI (Thăm dò)")
+            status_col.append("❌ LOẠI (Bước 2)")
             reason_col.append(" | ".join(reasons))
 
     work_df["step2_passed"] = passed_flags
     work_df["step2_status"] = status_col
-    work_df["markets_est"] = mkts_col
+    work_df["settled_markets"] = settled_col
+    work_df["open_summary"] = open_summary_col
+    work_df["recent_30d"] = recent_30d_col
     work_df["last_active"] = fresh_col
-    work_df["has_open"] = open_col
     work_df["recent_market"] = recent_col
     work_df["step2_reason"] = reason_col
 
@@ -625,58 +650,62 @@ def step2_surface_filter(
 
 
 # ==============================================================================
-# BƯỚC 3 (CHƯA TRIỂN KHAI): KIỂM TOÁN SỔ CÁI CHUYÊN SÂU (/positions + /activity)
+# BƯỚC 3 (CHƯA TRIỂN KHAI — CHỜ NGHIỆM THU XONG BƯỚC 2)
 # ==============================================================================
 
 def step3_deep_ledger_audit(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     """
     [PLACEHOLDER - CHƯA TRIỂN KHAI]
-    Sau này sẽ nhận danh sách ví đã ĐẠT BƯỚC 2 để đối chiếu toàn bộ sổ cái
-    (/v2/positions 4 trạng thái + /v2/activity): True ROI 1 chiều, CapEdge,
-    Z-score, tỷ trọng lãi đáo hạn REDEEM >= 80%, PnL ex-Top 5 > 0.
-    Hiện tại giữ nguyên 100% dữ liệu từ Bước 2.
+    Giữ nguyên 100% danh sách ví đã đạt Bước 2 cho đến khi bạn xác nhận xong Bước 2.
     """
     return df.copy(), "Chưa triển khai (Pass-through 100%)"
 
 
 # ==============================================================================
-# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN PIPELINE
+# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN PIPELINE (BƯỚC 1 -> BƯỚC 2)
 # ==============================================================================
 
-st.title("📡 Polymarket Wallet Finder — Pipeline Bước 1 & Bước 2")
+st.title("📡 Polymarket Wallet Finder — Kiểm Toán Bước 2")
 st.caption(
-    "Lộ trình 3 bước trong cùng 1 ứng dụng: "
-    "**Bước 1: Thu thập Top N ví thô (Xong)** → "
-    "**Bước 2: Lọc bề mặt, độ tươi & quy mô mẫu (Đang chạy)** → "
+    "**Bước 1:** Thu thập Top N ví Leaderboard (Xong) → "
+    "**Bước 2:** Lọc P/V, chặn ôm xác vị thế 0¢ & khóa độ tươi (Đang kiểm toán) → "
     "*Bước 3: Kiểm toán sổ cái sâu (Chờ)*."
 )
 
 s1, s2, s3 = st.columns(3)
 s1.success("✅ **Bước 1: Thu thập Top N ví**\n\nHoạt động (< 1 giây)")
-s2.success("✅ **Bước 2: Lọc bề mặt & Độ tươi**\n\nHoạt động (8 luồng thăm dò v2)")
-s3.info("⏳ **Bước 3: Kiểm toán sổ cái sâu**\n\nChưa triển khai (Pass-through)")
+s2.success("✅ **Bước 2: Lọc Bề mặt & Chặn Xác 0¢**\n\nĐang kiểm toán (CLOSED vs xác 0¢)")
+s3.info("⏳ **Bước 3: Kiểm toán Sổ cái Sâu**\n\nChưa triển khai (Pass-through)")
 
-# Sidebar cấu hình ngưỡng cho Bước 2
 with st.sidebar:
     st.header("⚙️ Ngưỡng Lọc Bước 2")
-    st.caption("Áp dụng ngay sau khi kéo Top N ví ở Bước 1:")
+    st.caption("Tinh chỉnh các chốt chặn của Bước 2 tại đây:")
     min_pv_pct = st.slider("1. Sàn PnL / UI Volume (%)", 0.0, 15.0, 4.0, 0.5)
     min_net_pnl = st.number_input("2. Net PnL tối thiểu ($)", min_value=0.0, value=5000.0, step=1000.0)
 
     c_m1, c_m2 = st.columns(2)
-    min_markets = c_m1.number_input("3. Số kèo tối thiểu", min_value=1, max_value=500, value=80, step=10)
-    max_markets = c_m2.number_input("4. Số kèo tối đa", min_value=50, max_value=5000, value=1500, step=100)
+    min_markets = c_m1.number_input("3. Kèo đóng tối thiểu", min_value=1, max_value=500, value=80, step=10)
+    max_markets = c_m2.number_input("4. Kèo đóng tối đa", min_value=50, max_value=10000, value=3500, step=250)
 
-    max_inactive_days = st.slider("5. Ngừng chạy tối đa (ngày)", 1, 90, 14, 1)
-    allow_open_override = st.checkbox("Giữ ví nếu đang có lệnh OPEN", value=True)
+    max_dead_open = st.number_input(
+        "5. Trần 'xác vị thế' về 0¢ tối đa",
+        min_value=0,
+        max_value=500,
+        value=15,
+        step=5,
+        help="Chặn bot rải lệnh & ví ôm xác vị thế 0¢ chưa đóng trong tab OPEN.",
+    )
+    max_inactive_days = st.slider("6. Ngừng chạy tối đa (ngày)", 1, 90, 30, 1)
+    allow_live_open_override = st.checkbox("Giữ ví nếu đang có lệnh OPEN sống (> $1)", value=True)
 
 step2_cfg = {
     "min_pv_pct": min_pv_pct,
     "min_net_pnl": min_net_pnl,
     "min_markets": min_markets,
     "max_markets": max_markets,
+    "max_dead_open": max_dead_open,
     "max_inactive_days": max_inactive_days,
-    "allow_open_override": allow_open_override,
+    "allow_live_open_override": allow_live_open_override,
 }
 
 st.divider()
@@ -724,7 +753,7 @@ for key, default_val in [
         st.session_state[key] = default_val
 
 if run_clicked:
-    with st.spinner(f"Đang kéo Top {int(selected_top_n)} ví & chạy bộ lọc độ tươi Bước 2..."):
+    with st.spinner(f"Đang kéo Top {int(selected_top_n)} ví & kiểm toán Bước 2 ({cat_code})..."):
         t_start = time.perf_counter()
         df_step1, meta = step1_fetch_leaderboard(
             category=cat_code,
@@ -778,54 +807,42 @@ if meta_res:
             "Pass-through",
         )
 
-        view_mode = st.radio(
-            "Chế độ hiển thị bảng:",
-            options=[
-                f"✅ Chỉ hiển thị {len(df_passed)} ví ĐẠT BƯỚC 2 (Đầu vào cho Bước 3)",
-                f"📋 Hiển thị toàn bộ {len(df_all_s2)} ví kèm chẩn đoán Đạt / Loại ở Bước 2",
-            ],
-            horizontal=True,
-        )
+        col_cfg = {
+            "rank": st.column_config.NumberColumn("Hạng", format="#%d", width="small"),
+            "step2_status": st.column_config.TextColumn("Trạng thái B2", width="medium"),
+            "user_name": st.column_config.TextColumn("Tên hiển thị", width="medium"),
+            "wallet": st.column_config.TextColumn("Địa chỉ ví", width="medium"),
+            "pnl_usdc": st.column_config.NumberColumn("PnL ($)", format="$%+,.2f"),
+            "ui_volume_usdc": st.column_config.NumberColumn("UI Volume ($)", format="$%,.2f"),
+            "pnl_to_ui_vol_pct": st.column_config.NumberColumn("P/V (%)", format="%.2f%%"),
+            "settled_markets": st.column_config.TextColumn("Kèo đã đóng", width="small"),
+            "open_summary": st.column_config.TextColumn("OPEN (Sống / Xác 0¢)", width="medium"),
+            "recent_30d": st.column_config.TextColumn("Hoạt động 30d", width="small"),
+            "last_active": st.column_config.TextColumn("Lệnh cuối", width="small"),
+            "recent_market": st.column_config.TextColumn("Kèo gần nhất", width="large"),
+            "step2_reason": st.column_config.TextColumn("Lý do Đạt / Loại", width="large"),
+            "profile_url": st.column_config.LinkColumn("Polymarket", display_text="Mở Profile"),
+        }
 
-        df_show = df_passed if view_mode.startswith("✅") else df_all_s2
+        display_cols = [c for c in col_cfg.keys() if c in df_all_s2.columns]
 
-        display_cols = [
-            "rank",
-            "step2_status",
-            "user_name",
-            "wallet",
-            "pnl_usdc",
-            "ui_volume_usdc",
-            "pnl_to_ui_vol_pct",
-            "markets_est",
-            "last_active",
-            "has_open",
-            "recent_market",
-            "step2_reason",
-            "profile_url",
-        ]
-        avail_cols = [c for c in display_cols if c in df_show.columns]
-
+        st.subheader(f"✅ Danh sách {len(df_passed)} ví ĐẠT BƯỚC 2 (Sạch xác vị thế & Đang chạy)")
         st.dataframe(
-            df_show[avail_cols],
+            df_passed[display_cols],
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "rank": st.column_config.NumberColumn("Hạng", format="#%d", width="small"),
-                "step2_status": st.column_config.TextColumn("Trạng thái B2", width="medium"),
-                "user_name": st.column_config.TextColumn("Tên hiển thị", width="medium"),
-                "wallet": st.column_config.TextColumn("Địa chỉ ví", width="medium"),
-                "pnl_usdc": st.column_config.NumberColumn("PnL ($)", format="$%+,.2f"),
-                "ui_volume_usdc": st.column_config.NumberColumn("UI Volume ($)", format="$%,.2f"),
-                "pnl_to_ui_vol_pct": st.column_config.NumberColumn("P/V (%)", format="%.2f%%"),
-                "markets_est": st.column_config.TextColumn("Số kèo", width="small"),
-                "last_active": st.column_config.TextColumn("Lệnh cuối", width="small"),
-                "has_open": st.column_config.CheckboxColumn("Đang OPEN"),
-                "recent_market": st.column_config.TextColumn("Kèo gần nhất", width="large"),
-                "step2_reason": st.column_config.TextColumn("Lý do Đạt / Loại", width="large"),
-                "profile_url": st.column_config.LinkColumn("Polymarket", display_text="Mở Profile"),
-            },
+            column_config=col_cfg,
         )
+
+        df_rejected = df_all_s2[~df_all_s2["step2_passed"]].reset_index(drop=True)
+        if not df_rejected.empty:
+            with st.expander(f"🔎 Xem chi tiết {len(df_rejected)} ví BỊ LOẠI ở Bước 2 & Lý do cụ thể", expanded=True):
+                st.dataframe(
+                    df_rejected[display_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=col_cfg,
+                )
 
         dl1, dl2 = st.columns(2)
         prefix = f"step2_{meta_res['category'].lower()}_{meta_res['time_period'].lower()}"
