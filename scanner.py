@@ -64,7 +64,7 @@ def get_http_session() -> requests.Session:
         sess.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "Polymarket-Wallet-Finder/3.2",
+                "User-Agent": "Polymarket-Wallet-Finder/3.3",
             }
         )
         _THREAD_LOCAL.session = sess
@@ -285,7 +285,6 @@ def step1_fetch_leaderboard(
     errors: list[str] = []
     debug_notes: list[str] = []
 
-    # Chia lô an toàn <= 20 ví/request để tránh API trả rỗng khi limit quá lớn
     for page_limit in (min(20, top_n), 10):
         raw_records.clear()
         seen_wallets_raw.clear()
@@ -313,7 +312,6 @@ def step1_fetch_leaderboard(
             try:
                 payload, http_code = request_json_with_retry(LEADERBOARD_V2_URL, params=params)
             except Exception as exc:
-                # Nếu truyền chỉ mỗi cursor bị 400 -> thử gửi kèm bộ lọc gốc
                 if cursor is not None:
                     try:
                         retry_params = {
@@ -361,7 +359,6 @@ def step1_fetch_leaderboard(
         if raw_records:
             break
 
-    # Fallback sang v1 nếu v2 không trả bản ghi nào
     if not raw_records:
         used_endpoint = LEADERBOARD_V1_URL
         offset = 0
@@ -471,7 +468,6 @@ def _probe_and_cache_positions(wallet: str, max_settled_cap: int, max_dead_cap: 
     recent_30d_cids: set[str] = set()
     seed_acts: list[dict[str, Any]] = []
 
-    # 1. Hoạt động gần nhất (/v2/activity?limit=100)
     try:
         act_payload, _ = request_json_with_retry(
             ACTIVITY_V2_URL, params={"user": wallet, "limit": 100}, retries=2, timeout=10
@@ -494,7 +490,6 @@ def _probe_and_cache_positions(wallet: str, max_settled_cap: int, max_dead_cap: 
     except Exception:
         pass
 
-    # 2. Tải OPEN (tách lệnh sống vs xác 0¢)
     open_pages = max(2, math.ceil((max_dead_cap + 200) / 500))
     open_rows, open_capped = _fetch_positions_by_status(
         wallet, "OPEN", max_pages=open_pages, stop_cid_cap=max_dead_cap + 100
@@ -516,7 +511,6 @@ def _probe_and_cache_positions(wallet: str, max_settled_cap: int, max_dead_cap: 
         else:
             dead_zero_open_cnt += 1
 
-    # 3. Tải CLOSED + REDEEMABLE + REDEEMABLE_LOST (dùng chung cho Bước 3, KHÔNG tải lại!)
     settled_cids: set[str] = set()
     max_pages_closed = min(8, max(2, math.ceil((max_settled_cap + 200) / 500)))
     closed_rows, settled_capped = _fetch_positions_by_status(
@@ -596,7 +590,6 @@ def step2_surface_filter(
         else:
             pre_pass_wallets.append(w)
 
-    # Chỉ gọi mạng cho những ví CHƯA có trong wallet_cache
     to_fetch = [w for w in pre_pass_wallets if w not in wallet_cache]
     done_cnt = len(pre_pass_wallets) - len(to_fetch)
 
@@ -836,35 +829,61 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
         calc_pnl,
     )
 
-    size_cost = np.where(
-        pos_df["total_size"] > 0,
-        pos_df["total_size"] * pos_df["avg_price"],
-        pos_df["current_size"] * pos_df["avg_price"],
-    )
-    inferred_cost = np.where(
-        (pos_df["total_pnl"] < 0) & (pos_df["status"] != "OPEN"),
-        pos_df["total_pnl"].abs(),
-        np.where(
-            (pos_df["total_pnl"] > 0) & (pos_df["avg_price"] > 0.005) & (pos_df["avg_price"] < 0.995),
-            pos_df["total_pnl"] * pos_df["avg_price"] / (1.0 - pos_df["avg_price"]),
-            0.0,
-        ),
-    )
-
-    pos_df["true_cost"] = np.where(
+    # 1. Vốn tường minh từ Activity hoặc API fields
+    explicit_cost = np.where(
         pos_df["act_buy_usdc"] > 0,
         pos_df["act_buy_usdc"],
         np.where(
             pos_df["total_cost_usdc"] > 0,
             pos_df["total_cost_usdc"],
-            np.where(
-                pos_df["entry_cost_usdc"] > 0,
-                pos_df["entry_cost_usdc"],
-                np.where(size_cost > 0, size_cost, inferred_cost),
-            ),
+            np.where(pos_df["entry_cost_usdc"] > 0, pos_df["entry_cost_usdc"], 0.0),
         ),
     )
 
+    # 2. Vốn từ shares * avg_price (không dùng current_size cho lệnh đã CLOSED để tránh bụi shares)
+    raw_size_for_cost = np.where(
+        pos_df["total_size"] > 0,
+        pos_df["total_size"],
+        np.where(pos_df["status"].isin(["OPEN", "SETTLED_LOSS_0C"]), pos_df["current_size"], 0.0),
+    )
+    size_cost = raw_size_for_cost * pos_df["avg_price"]
+
+    # 3. Vốn suy ngược từ total_pnl và avg_price cho các vị thế lịch sử đã đóng (UNMATCHED_OLD)
+    inferred_cost = np.where(
+        (pos_df["total_pnl"] < 0) & (pos_df["status"] != "OPEN"),
+        pos_df["total_pnl"].abs(),
+        np.where(
+            (pos_df["total_pnl"] > 0)
+            & (pos_df["status"] != "OPEN")
+            & (pos_df["avg_price"] > 0.005)
+            & (pos_df["avg_price"] < 0.995),
+            pos_df["total_pnl"] * pos_df["avg_price"] / (1.0 - pos_df["avg_price"]),
+            0.0,
+        ),
+    )
+
+    # Loại bỏ size_cost dạng bụi trên các vị thế cũ đã đóng nếu lệch quá 50% so với vốn suy ngược
+    valid_size_cost = np.where(
+        (pos_df["status"] != "OPEN")
+        & (inferred_cost > 0)
+        & (size_cost < 0.5 * inferred_cost),
+        0.0,
+        size_cost,
+    )
+
+    pos_df["true_cost"] = np.where(
+        explicit_cost > 0,
+        explicit_cost,
+        np.where(valid_size_cost > 0, valid_size_cost, inferred_cost),
+    )
+
+    # Chốt chặn vật lý: Trên quyền chọn nhị phân không đòn bẩy, vốn gốc không bao giờ nhỏ hơn khoản lỗ
+    pos_df["true_cost"] = np.maximum(
+        pos_df["true_cost"],
+        np.where(pos_df["total_pnl"] < 0, pos_df["total_pnl"].abs(), 0.0),
+    )
+
+    # Đảm bảo xác vị thế 0¢ chưa claim luôn ghi nhận lỗ đầy đủ nếu API trả total_pnl = 0
     zero_pnl_dead = (pos_df["status"] == "SETTLED_LOSS_0C") & (pos_df["total_pnl"].abs() < 1e-6) & (pos_df["true_cost"] > 0)
     pos_df["total_pnl"] = np.where(zero_pnl_dead, -pos_df["true_cost"], pos_df["total_pnl"])
 
@@ -1105,12 +1124,6 @@ def step3_deep_ledger_audit(
     activity_cache: dict[str, list[dict[str, Any]]],
     progress_cb=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame], dict[str, Any]]:
-    """
-    Bước 3 siêu tốc 2 chặng:
-      - Chặng 3A (0ms mạng): Chấm sơ bộ trên raw_positions đã tải từ Bước 2.
-        Ví nào rớt nặng (high_fav, pnl_ex_top5 <= 0, true_roi âm/thấp, cap_edge thấp) -> DỪNG SỚM.
-      - Chặng 3B: Chỉ kéo /v2/activity cho nhóm ứng viên sống sót qua Chặng 3A.
-    """
     t0 = time.perf_counter()
     if df_step2_passed.empty:
         return (
@@ -1128,7 +1141,6 @@ def step3_deep_ledger_audit(
     details_map: dict[str, pd.DataFrame] = {}
     stage3b_candidates: list[str] = []
 
-    # CHẶNG 3A: Chạy CPU thuần trên raw_positions có sẵn từ Bước 2
     for w in wallets:
         cached = wallet_cache.get(w, {})
         raw_pos = cached.get("raw_positions") or []
@@ -1137,7 +1149,6 @@ def step3_deep_ledger_audit(
         pre_df = _build_ledger_from_raw(raw_pos, seed_acts)
         pre_score = _score_ledger_df(pre_df, cfg, skipped_activity=True)
 
-        # Chỉ cho qua Chặng 3B (kéo Activity) nếu không dính lỗi chí mạng ở sổ vị thế
         fail_hard_3a = (
             pre_df.empty
             or pre_score["high_fav_pct"] > float(cfg["max_high_fav"]) + 5.0
@@ -1153,7 +1164,6 @@ def step3_deep_ledger_audit(
         else:
             stage3b_candidates.append(w)
 
-    # CHẶNG 3B: Kéo /v2/activity song song (4 luồng) CHỈ cho nhóm sáng giá chưa có trong activity_cache
     to_fetch_act = [w for w in stage3b_candidates if w not in activity_cache]
     done_3b = len(stage3b_candidates) - len(to_fetch_act)
 
@@ -1219,7 +1229,7 @@ st.caption(
 s1, s2, s3 = st.columns(3)
 s1.success("✅ **Bước 1: Thu thập Leaderboard**\n\nChia lô an toàn 20/trang + Log lỗi rõ")
 s2.success("✅ **Bước 2: Lọc & Cache Positions**\n\nKhông tải trùng lặp sang Bước 3")
-s3.success("✅ **Bước 3: Sổ cái 2 Chặng + X-Ray**\n\nDừng sớm 3A, lọc lại từ Cache < 0.1s")
+s3.success("✅ **Bước 3: Sổ cái 2 Chặng + X-Ray**\n\nĐã vá chuẩn vốn UNMATCHED_OLD")
 
 for key, default_val in [
     ("df_step1_raw", pd.DataFrame()),
