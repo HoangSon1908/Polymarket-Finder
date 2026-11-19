@@ -13,7 +13,7 @@ from requests.adapters import HTTPAdapter
 import streamlit as st
 
 st.set_page_config(
-    page_title="Polymarket Pro Wallet Finder — Full 3-Step Pipeline",
+    page_title="Polymarket Pro Wallet Finder — Fast 3-Step Pipeline",
     page_icon="📡",
     layout="wide",
 )
@@ -64,7 +64,7 @@ def get_http_session() -> requests.Session:
         sess.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "Polymarket-Wallet-Finder/3.1",
+                "User-Agent": "Polymarket-Wallet-Finder/3.2",
             }
         )
         _THREAD_LOCAL.session = sess
@@ -76,22 +76,23 @@ def request_json_with_retry(
     params: dict[str, Any],
     retries: int = 3,
     timeout: int = 12,
-) -> Any:
+) -> tuple[Any, int]:
+    """Trả về (json_payload, http_status_code) để chẩn đoán chính xác kể cả khi data rỗng."""
     session = get_http_session()
     last_err = None
     for attempt in range(retries):
         try:
             resp = session.get(url, params=params, timeout=timeout)
             if resp.status_code == 429:
-                time.sleep(1.1 * (attempt + 1))
+                time.sleep(1.0 * (attempt + 1))
                 continue
             resp.raise_for_status()
-            return resp.json()
+            return resp.json(), resp.status_code
         except Exception as exc:
             last_err = exc
             if attempt < retries - 1:
                 time.sleep(0.4 * (attempt + 1))
-    raise RuntimeError(f"Gọi {url} thất bại với params={params}: {last_err}")
+    raise RuntimeError(f"Gọi {url} thất bại (params={params}): {last_err}")
 
 
 def _extract_wallet_address(item: dict[str, Any]) -> str:
@@ -184,13 +185,30 @@ def _to_unix_ts(raw_ts: Any) -> float:
     return dt.timestamp() if dt is not None else float("nan")
 
 
+def _extract_batch_and_cursor(payload: Any) -> tuple[list[dict[str, Any]], str | None, bool]:
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)], None, False
+    if isinstance(payload, dict):
+        batch = (
+            payload.get("data")
+            or payload.get("results")
+            or payload.get("leaderboard")
+            or payload.get("items")
+            or []
+        )
+        pagination = payload.get("pagination") or {}
+        next_cursor = pagination.get("next_cursor") or payload.get("next_cursor")
+        has_more = bool(pagination.get("has_more", bool(next_cursor)))
+        return [r for r in batch if isinstance(r, dict)], next_cursor, has_more
+    return [], None, False
+
+
 def _fetch_positions_by_status(
     wallet: str,
     status_val: str,
-    max_pages: int = 10,
+    max_pages: int = 8,
     stop_cid_cap: int | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Kéo danh sách vị thế theo đúng status trên Data API v2 (cursor pagination)."""
     rows: list[dict[str, Any]] = []
     unique_cids: set[str] = set()
     cursor: str | None = None
@@ -201,25 +219,16 @@ def _fetch_positions_by_status(
         if cursor:
             params["cursor"] = cursor
         try:
-            payload = request_json_with_retry(POSITIONS_V2_URL, params=params, retries=2, timeout=12)
+            payload, _ = request_json_with_retry(POSITIONS_V2_URL, params=params, retries=2, timeout=10)
         except Exception:
             break
 
-        if isinstance(payload, dict):
-            batch = payload.get("data") or []
-            pagination = payload.get("pagination") or {}
-            cursor = pagination.get("next_cursor")
-            has_more = bool(pagination.get("has_more", bool(cursor)))
-        elif isinstance(payload, list):
-            batch = payload
-            cursor = None
-            has_more = False
-        else:
+        batch, cursor, has_more = _extract_batch_and_cursor(payload)
+        if not batch:
             break
 
         for r in batch:
-            if not isinstance(r, dict):
-                continue
+            r["_queried_status"] = status_val
             rows.append(r)
             cid = str(r.get("condition_id") or r.get("conditionId") or "").strip()
             if cid:
@@ -234,8 +243,7 @@ def _fetch_positions_by_status(
     return rows, capped
 
 
-def _fetch_activities_v2(wallet: str, max_pages: int = 8) -> list[dict[str, Any]]:
-    """Kéo lịch sử giao dịch gần nhất từ /v2/activity bằng phân trang cursor."""
+def _fetch_activities_v2(wallet: str, max_pages: int = 4) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     cursor: str | None = None
     for _ in range(max_pages):
@@ -243,33 +251,22 @@ def _fetch_activities_v2(wallet: str, max_pages: int = 8) -> list[dict[str, Any]
         if cursor:
             params["cursor"] = cursor
         try:
-            payload = request_json_with_retry(ACTIVITY_V2_URL, params=params, retries=2, timeout=12)
+            payload, _ = request_json_with_retry(ACTIVITY_V2_URL, params=params, retries=2, timeout=10)
         except Exception:
             break
 
-        if isinstance(payload, dict):
-            batch = payload.get("data") or []
-            pagination = payload.get("pagination") or {}
-            cursor = pagination.get("next_cursor")
-            has_more = bool(pagination.get("has_more", bool(cursor)))
-        elif isinstance(payload, list):
-            batch = payload
-            cursor = None
-            has_more = False
-        else:
+        batch, cursor, has_more = _extract_batch_and_cursor(payload)
+        if not batch:
             break
 
-        for r in batch:
-            if isinstance(r, dict):
-                rows.append(r)
-
+        rows.extend(batch)
         if not cursor or not has_more:
             break
     return rows
 
 
 # ==============================================================================
-# BƯỚC 1: THU THẬP DỮ LIỆU THÔ TOP N VÍ TỪ LEADERBOARD
+# BƯỚC 1: THU THẬP TOP N VÍ (CHIA LÔ AN TOÀN 20/TRANG + LOG CHẨN ĐOÁN RÕ)
 # ==============================================================================
 
 def step1_fetch_leaderboard(
@@ -283,62 +280,95 @@ def step1_fetch_leaderboard(
     ob_code = order_by.strip().upper()
 
     raw_records: list[dict[str, Any]] = []
+    seen_wallets_raw: set[str] = set()
     used_endpoint = LEADERBOARD_V2_URL
     errors: list[str] = []
-    max_pages = max(1, math.ceil(top_n / 50))
+    debug_notes: list[str] = []
 
-    cursor: str | None = None
-    v2_failed_first_page = False
+    # Chia lô an toàn <= 20 ví/request để tránh API trả rỗng khi limit quá lớn
+    for page_limit in (min(20, top_n), 10):
+        raw_records.clear()
+        seen_wallets_raw.clear()
+        cursor: str | None = None
+        offset = 0
+        max_pages = max(1, math.ceil(top_n / page_limit)) + 1
 
-    for page_idx in range(max_pages):
-        if len(raw_records) >= top_n:
+        for page_idx in range(max_pages):
+            if len(raw_records) >= top_n:
+                break
+
+            req_limit = min(page_limit, top_n - len(raw_records))
+            if cursor is not None:
+                params: dict[str, Any] = {"cursor": cursor}
+            else:
+                params = {
+                    "category": cat_code,
+                    "time_period": tp_code,
+                    "order_by": ob_code,
+                    "limit": req_limit,
+                }
+                if offset > 0:
+                    params["offset"] = offset
+
+            try:
+                payload, http_code = request_json_with_retry(LEADERBOARD_V2_URL, params=params)
+            except Exception as exc:
+                # Nếu truyền chỉ mỗi cursor bị 400 -> thử gửi kèm bộ lọc gốc
+                if cursor is not None:
+                    try:
+                        retry_params = {
+                            "category": cat_code,
+                            "time_period": tp_code,
+                            "order_by": ob_code,
+                            "limit": req_limit,
+                            "cursor": cursor,
+                        }
+                        payload, http_code = request_json_with_retry(LEADERBOARD_V2_URL, params=retry_params)
+                    except Exception as exc2:
+                        errors.append(f"[v2 cursor] {exc2}")
+                        break
+                else:
+                    errors.append(f"[v2 p{page_idx}] {exc}")
+                    break
+
+            batch, next_cursor, has_more = _extract_batch_and_cursor(payload)
+            if not batch:
+                preview = str(payload)[:260]
+                debug_notes.append(f"HTTP {http_code} với limit={req_limit} trả batch rỗng: {preview}")
+                break
+
+            added_new = 0
+            for r in batch:
+                w = _extract_wallet_address(r)
+                k = w if w else f"row_{len(raw_records)}_{added_new}"
+                if k in seen_wallets_raw:
+                    continue
+                seen_wallets_raw.add(k)
+                raw_records.append(r)
+                added_new += 1
+
+            if added_new == 0:
+                break
+
+            if next_cursor and has_more:
+                cursor = next_cursor
+            elif len(batch) >= req_limit and len(raw_records) < top_n:
+                cursor = None
+                offset += len(batch)
+            else:
+                break
+
+        if raw_records:
             break
 
-        if cursor is None:
-            params: dict[str, Any] = {
-                "category": cat_code,
-                "time_period": tp_code,
-                "order_by": ob_code,
-                "limit": min(50, top_n - len(raw_records)),
-            }
-        else:
-            params = {"cursor": cursor}
-
-        try:
-            payload = request_json_with_retry(LEADERBOARD_V2_URL, params=params)
-        except Exception as exc:
-            errors.append(f"[v2] {exc}")
-            if page_idx == 0:
-                v2_failed_first_page = True
-            break
-
-        if isinstance(payload, dict):
-            batch = payload.get("data") or payload.get("results") or []
-            pagination = payload.get("pagination") or {}
-            cursor = pagination.get("next_cursor")
-            has_more = bool(pagination.get("has_more", bool(cursor)))
-        elif isinstance(payload, list):
-            batch = payload
-            cursor = None
-            has_more = False
-        else:
-            break
-
-        if not batch:
-            break
-
-        raw_records.extend(r for r in batch if isinstance(r, dict))
-
-        if not cursor or not has_more:
-            break
-
-    if v2_failed_first_page and not raw_records:
+    # Fallback sang v1 nếu v2 không trả bản ghi nào
+    if not raw_records:
         used_endpoint = LEADERBOARD_V1_URL
         offset = 0
         while len(raw_records) < top_n:
-            batch_limit = min(50, top_n - len(raw_records))
+            batch_limit = min(20, top_n - len(raw_records))
             try:
-                payload_v1 = request_json_with_retry(
+                payload_v1, _ = request_json_with_retry(
                     LEADERBOARD_V1_URL,
                     params={
                         "category": cat_code,
@@ -347,15 +377,12 @@ def step1_fetch_leaderboard(
                         "limit": batch_limit,
                         "offset": offset,
                     },
+                    retries=2,
                 )
-                batch_v1 = (
-                    payload_v1.get("data") or []
-                    if isinstance(payload_v1, dict)
-                    else (payload_v1 or [])
-                )
+                batch_v1, _, _ = _extract_batch_and_cursor(payload_v1)
                 if not batch_v1:
                     break
-                raw_records.extend(r for r in batch_v1 if isinstance(r, dict))
+                raw_records.extend(batch_v1)
                 offset += len(batch_v1)
                 if len(batch_v1) < batch_limit:
                     break
@@ -374,6 +401,7 @@ def step1_fetch_leaderboard(
         "requested_top_n": top_n,
         "returned_count": 0,
         "errors": errors,
+        "debug_notes": debug_notes,
         "raw_records": raw_records,
     }
 
@@ -406,14 +434,6 @@ def step1_fetch_leaderboard(
         vol_val = _pick_first_float(item, ("vol", "volume", "total_volume", "totalVolume", "usdc_volume"))
         pnl_vol_pct = (pnl_val / vol_val * 100.0) if vol_val > 0 else 0.0
 
-        x_user = _pick_first_str(item, ("x_username", "xUsername", "twitter", "x_handle"))
-        verified_flag = bool(
-            item.get("verified_badge")
-            or item.get("verifiedBadge")
-            or item.get("verified")
-            or False
-        )
-
         normalized_rows.append(
             {
                 "rank": rank_val,
@@ -422,8 +442,8 @@ def step1_fetch_leaderboard(
                 "pnl_usdc": round(pnl_val, 2),
                 "ui_volume_usdc": round(vol_val, 2),
                 "pnl_to_ui_vol_pct": round(pnl_vol_pct, 2),
-                "x_username": x_user,
-                "verified": verified_flag,
+                "x_username": _pick_first_str(item, ("x_username", "xUsername", "twitter", "x_handle")),
+                "verified": bool(item.get("verified_badge") or item.get("verifiedBadge") or item.get("verified") or False),
                 "category": cat_code,
                 "time_period": tp_code,
                 "profile_url": f"https://polymarket.com/profile/{wallet}" if wallet else "",
@@ -439,27 +459,26 @@ def step1_fetch_leaderboard(
 
 
 # ==============================================================================
-# BƯỚC 2: LỌC BỀ MẶT, TÁCH CLOSED / OPEN & KHÓA ĐỘ TƯƠI (FAST REJECT GATE)
+# BƯỚC 2: THĂM DÒ + LƯU CACHE POSITIONS ĐỂ BƯỚC 3 TÁI SỬ DỤNG 100% (0ms MẠNG)
 # ==============================================================================
 
-def _probe_wallet_surface_v2(wallet: str, max_settled_cap: int, max_dead_cap: int) -> dict[str, Any]:
+def _probe_and_cache_positions(wallet: str, max_settled_cap: int, max_dead_cap: int) -> dict[str, Any]:
     now_utc = datetime.now(timezone.utc)
     cutoff_30d = now_utc - timedelta(days=30)
 
     days_since_last: float | None = None
     recent_market_title = ""
     recent_30d_cids: set[str] = set()
+    seed_acts: list[dict[str, Any]] = []
 
     # 1. Hoạt động gần nhất (/v2/activity?limit=100)
     try:
-        act_payload = request_json_with_retry(
+        act_payload, _ = request_json_with_retry(
             ACTIVITY_V2_URL, params={"user": wallet, "limit": 100}, retries=2, timeout=10
         )
-        act_rows = act_payload.get("data") or [] if isinstance(act_payload, dict) else (act_payload or [])
+        seed_acts, _, _ = _extract_batch_and_cursor(act_payload)
         latest_dt: datetime | None = None
-        for r in act_rows:
-            if not isinstance(r, dict):
-                continue
+        for r in seed_acts:
             if not recent_market_title:
                 recent_market_title = str(r.get("title") or r.get("question") or "").strip()
             dt = _parse_timestamp_utc(r.get("timestamp") or r.get("created_at") or r.get("time"))
@@ -475,7 +494,7 @@ def _probe_wallet_surface_v2(wallet: str, max_settled_cap: int, max_dead_cap: in
     except Exception:
         pass
 
-    # 2. Vị thế OPEN: tách lệnh sống vs xác 0¢
+    # 2. Tải OPEN (tách lệnh sống vs xác 0¢)
     open_pages = max(2, math.ceil((max_dead_cap + 200) / 500))
     open_rows, open_capped = _fetch_positions_by_status(
         wallet, "OPEN", max_pages=open_pages, stop_cid_cap=max_dead_cap + 100
@@ -497,9 +516,9 @@ def _probe_wallet_surface_v2(wallet: str, max_settled_cap: int, max_dead_cap: in
         else:
             dead_zero_open_cnt += 1
 
-    # 3. Đếm số kèo đã đóng (CLOSED + REDEEMABLE + REDEEMABLE_LOST)
+    # 3. Tải CLOSED + REDEEMABLE + REDEEMABLE_LOST (dùng chung cho Bước 3, KHÔNG tải lại!)
     settled_cids: set[str] = set()
-    max_pages_closed = max(2, math.ceil((max_settled_cap + 200) / 500))
+    max_pages_closed = min(8, max(2, math.ceil((max_settled_cap + 200) / 500)))
     closed_rows, settled_capped = _fetch_positions_by_status(
         wallet, "CLOSED", max_pages=max_pages_closed, stop_cid_cap=max_settled_cap
     )
@@ -510,17 +529,21 @@ def _probe_wallet_surface_v2(wallet: str, max_settled_cap: int, max_dead_cap: in
         if not recent_market_title:
             recent_market_title = str(r.get("title") or "").strip()
 
+    redeem_rows: list[dict[str, Any]] = []
+    lost_rows: list[dict[str, Any]] = []
     if not settled_capped:
-        for extra_st in ("REDEEMABLE", "REDEEMABLE_LOST"):
-            extra_rows, _ = _fetch_positions_by_status(wallet, extra_st, max_pages=2, stop_cid_cap=500)
-            for r in extra_rows:
-                cid = str(r.get("condition_id") or r.get("conditionId") or "").strip()
-                if cid:
-                    settled_cids.add(cid)
+        redeem_rows, _ = _fetch_positions_by_status(wallet, "REDEEMABLE", max_pages=3, stop_cid_cap=500)
+        lost_rows, _ = _fetch_positions_by_status(wallet, "REDEEMABLE_LOST", max_pages=3, stop_cid_cap=500)
+        for r in redeem_rows + lost_rows:
+            cid = str(r.get("condition_id") or r.get("conditionId") or "").strip()
+            if cid:
+                settled_cids.add(cid)
 
     settled_count = len(settled_cids)
     if settled_count > max_settled_cap:
         settled_capped = True
+
+    all_cached_positions = open_rows + closed_rows + redeem_rows + lost_rows
 
     return {
         "settled_markets": settled_count,
@@ -531,12 +554,16 @@ def _probe_wallet_surface_v2(wallet: str, max_settled_cap: int, max_dead_cap: in
         "recent_30d_mkts": len(recent_30d_cids),
         "days_since_last": round(days_since_last, 1) if days_since_last is not None else None,
         "recent_market": recent_market_title[:75] if recent_market_title else "N/A",
+        "raw_positions": all_cached_positions,
+        "seed_acts": seed_acts,
     }
 
 
 def step2_surface_filter(
     df: pd.DataFrame,
     cfg: dict[str, Any],
+    wallet_cache: dict[str, dict[str, Any]],
+    progress_cb=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     t0 = time.perf_counter()
     if df.empty:
@@ -569,19 +596,22 @@ def step2_surface_filter(
         else:
             pre_pass_wallets.append(w)
 
-    probe_map: dict[str, dict[str, Any]] = {}
-    if pre_pass_wallets:
-        with ThreadPoolExecutor(max_workers=8) as executor:
+    # Chỉ gọi mạng cho những ví CHƯA có trong wallet_cache
+    to_fetch = [w for w in pre_pass_wallets if w not in wallet_cache]
+    done_cnt = len(pre_pass_wallets) - len(to_fetch)
+
+    if to_fetch:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             fut_to_w = {
-                executor.submit(_probe_wallet_surface_v2, w, max_mkts, max_dead_open): w
-                for w in pre_pass_wallets
+                executor.submit(_probe_and_cache_positions, w, max_mkts, max_dead_open): w
+                for w in to_fetch
             }
             for fut in as_completed(fut_to_w):
                 w = fut_to_w[fut]
                 try:
-                    probe_map[w] = fut.result()
+                    wallet_cache[w] = fut.result()
                 except Exception as exc:
-                    probe_map[w] = {
+                    wallet_cache[w] = {
                         "settled_markets": 0,
                         "settled_capped": False,
                         "live_open": 0,
@@ -590,7 +620,12 @@ def step2_surface_filter(
                         "recent_30d_mkts": 0,
                         "days_since_last": None,
                         "recent_market": f"Lỗi: {exc}",
+                        "raw_positions": [],
+                        "seed_acts": [],
                     }
+                done_cnt += 1
+                if progress_cb:
+                    progress_cb(done_cnt, len(pre_pass_wallets))
 
     status_col, passed_flags, settled_col, open_summary_col = [], [], [], []
     recent_30d_col, fresh_col, recent_col, reason_col = [], [], [], []
@@ -608,7 +643,7 @@ def step2_surface_filter(
             reason_col.append(" | ".join(pre_fail_reasons[w]))
             continue
 
-        info = probe_map.get(w, {})
+        info = wallet_cache.get(w, {})
         m_cnt = int(info.get("settled_markets") or 0)
         m_capped = bool(info.get("settled_capped", False))
         live_open = int(info.get("live_open") or 0)
@@ -680,28 +715,10 @@ def step2_surface_filter(
 
 
 # ==============================================================================
-# BƯỚC 3 (ĐÃ TRIỂN KHAI): KIỂM TOÁN SỔ CÁI CHUYÊN SÂU & CHẤM ĐIỂM COPY-TRADE
+# BƯỚC 3: KIỂM TOÁN 2 CHẶNG (3A CPU TRÊN POSITIONS CACHE -> 3B ACTIVITY CHỌN LỌC)
 # ==============================================================================
 
-def _build_wallet_ledger_df(
-    wallet: str,
-    max_pos_pages: int = 10,
-    max_act_pages: int = 8,
-) -> pd.DataFrame:
-    """
-    Hợp nhất toàn bộ 4 trạng thái /v2/positions và đối soát /v2/activity:
-      - Khử trùng lặp (token_id, outcome)
-      - Quy đổi xác vị thế OPEN giá 0¢ sang SETTLED_LOSS_0C (chống ảo Win Rate)
-      - Chống lỗi entry_cost_usdc=0 bằng chuỗi ưu tiên: act_buy_usdc -> total_cost_usdc -> entry_cost_usdc -> total_size*avg_price
-      - Gắn cờ has_act_match để tính HOLD_TO_EXPIRY vs SOLD_EARLY chính xác, không bị nhiễu bởi phân trang.
-    """
-    raw_pos: list[dict[str, Any]] = []
-    for st_name in ("OPEN", "CLOSED", "REDEEMABLE", "REDEEMABLE_LOST"):
-        rows, _ = _fetch_positions_by_status(wallet, st_name, max_pages=max_pos_pages, stop_cid_cap=None)
-        for r in rows:
-            r["_queried_status"] = st_name
-            raw_pos.append(r)
-
+def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str, Any]]) -> pd.DataFrame:
     if not raw_pos:
         return pd.DataFrame()
 
@@ -733,7 +750,6 @@ def _build_wallet_ledger_df(
     slug_s = get_col(pos_df, ["event_slug", "eventSlug", "slug"], "")
     pos_df["url"] = slug_s.apply(lambda s: f"https://polymarket.com/event/{s}" if pd.notna(s) and str(s).strip() else "")
 
-    # Khử trùng lặp theo (token_id, outcome)
     status_rank = {"OPEN": 1, "REDEEMABLE": 2, "REDEEMABLE_LOST": 2, "CLOSED": 3}
     pos_df["_srank"] = pos_df["raw_status"].map(status_rank).fillna(9)
     pos_df["_dedup_tok"] = np.where(pos_df["token_id"] != "", pos_df["token_id"], pos_df["condition_id"])
@@ -744,14 +760,11 @@ def _build_wallet_ledger_df(
         .reset_index(drop=True)
     )
 
-    # Phân loại chính xác OPEN sống vs xác vị thế 0¢ (đã thua chưa claim)
+    # Quy đổi xác vị thế OPEN về 0¢ sang nhóm thua đã ngã ngũ (SETTLED_LOSS_0C)
     is_dead_0c = (pos_df["raw_status"] == "OPEN") & (pos_df["cur_price"] <= 0.01) & (pos_df["current_value"] <= 0.5)
     pos_df["status"] = np.where(is_dead_0c, "SETTLED_LOSS_0C", pos_df["raw_status"])
 
-    # Kéo /v2/activity gần nhất để phân tích vi cấu trúc gom/thoát lệnh
-    raw_act = _fetch_activities_v2(wallet, max_pages=max_act_pages)
     act_agg_by_tok: dict[str, dict[str, Any]] = {}
-
     if raw_act:
         act_df = pd.DataFrame(raw_act)
         act_df["token_id"] = get_col(act_df, ["token_id", "asset", "asset_id"], "").astype(str).str.strip()
@@ -783,16 +796,8 @@ def _build_wallet_ledger_df(
             last_buy_ts = buys["ts"].max() if not buys.empty else grp["ts"].max()
             last_ev_ts = grp["ts"].max()
 
-            accum_h = (
-                max(0.0, (last_buy_ts - first_buy_ts) / 3600.0)
-                if pd.notna(first_buy_ts) and pd.notna(last_buy_ts)
-                else 0.0
-            )
-            hold_h = (
-                max(0.0, (last_ev_ts - first_buy_ts) / 3600.0)
-                if pd.notna(first_buy_ts) and pd.notna(last_ev_ts)
-                else 0.0
-            )
+            accum_h = max(0.0, (last_buy_ts - first_buy_ts) / 3600.0) if pd.notna(first_buy_ts) and pd.notna(last_buy_ts) else 0.0
+            hold_h = max(0.0, (last_ev_ts - first_buy_ts) / 3600.0) if pd.notna(first_buy_ts) and pd.notna(last_ev_ts) else 0.0
 
             act_agg_by_tok[tid] = {
                 "has_act_match": True,
@@ -824,7 +829,6 @@ def _build_wallet_ledger_df(
     ]:
         pos_df[col] = act_merged[col].fillna(def_v) if col in act_merged.columns else def_v
 
-    # Tổng PnL chuẩn (ưu tiên api_total_pnl nếu hợp lệ, fallback realized + unrealized)
     calc_pnl = pos_df["realized_pnl"] + pos_df["unrealized_pnl"]
     pos_df["total_pnl"] = np.where(
         pos_df["api_total_pnl"].notna() & (pos_df["api_total_pnl"].abs() > 1e-6),
@@ -832,7 +836,6 @@ def _build_wallet_ledger_df(
         calc_pnl,
     )
 
-    # Chuỗi ưu tiên tính vốn mua 1 chiều chuẩn xác (chống lỗi entry_cost_usdc=0)
     size_cost = np.where(
         pos_df["total_size"] > 0,
         pos_df["total_size"] * pos_df["avg_price"],
@@ -862,11 +865,9 @@ def _build_wallet_ledger_df(
         ),
     )
 
-    # Đảm bảo xác vị thế 0¢ chưa claim luôn ghi nhận lỗ đầy đủ nếu API trả total_pnl = 0
     zero_pnl_dead = (pos_df["status"] == "SETTLED_LOSS_0C") & (pos_df["total_pnl"].abs() < 1e-6) & (pos_df["true_cost"] > 0)
     pos_df["total_pnl"] = np.where(zero_pnl_dead, -pos_df["true_cost"], pos_df["total_pnl"])
 
-    # Loại bỏ các dòng rác vốn < $1
     pos_df = pos_df[pos_df["true_cost"] >= 1.0].reset_index(drop=True)
     if pos_df.empty:
         return pos_df
@@ -874,12 +875,10 @@ def _build_wallet_ledger_df(
     pos_df["roi_pct"] = pos_df["total_pnl"] / pos_df["true_cost"] * 100.0
     pos_df["real_win"] = pos_df["total_pnl"] > 0
 
-    # Đánh dấu trận Hedge 2 đầu (cùng condition_id mua >= 2 outcome)
     cid_counts = pos_df[pos_df["condition_id"] != ""].groupby("condition_id")["outcome"].nunique()
     hedged_cids = set(cid_counts[cid_counts >= 2].index)
     pos_df["is_hedged"] = pos_df["condition_id"].isin(hedged_cids)
 
-    # Phân loại phong cách thoát lệnh (chỉ gắn nhãn HOLD/SOLD_EARLY khi có dữ liệu xác thực)
     def classify_exit(r) -> str:
         if r["status"] == "OPEN":
             return "OPEN_LIVE"
@@ -897,17 +896,10 @@ def _build_wallet_ledger_df(
 
     pos_df["exit_style"] = pos_df.apply(classify_exit, axis=1)
     pos_df["entry_time_vn"] = pd.to_datetime(pos_df["first_ts"], unit="s", utc=True, errors="coerce").dt.tz_convert(VN_TZ)
-
     return pos_df
 
 
-def _audit_single_wallet_step3(
-    wallet: str,
-    cfg: dict[str, Any],
-    max_pos_pages: int = 10,
-    max_act_pages: int = 8,
-) -> tuple[dict[str, Any], pd.DataFrame]:
-    pos_df = _build_wallet_ledger_df(wallet, max_pos_pages=max_pos_pages, max_act_pages=max_act_pages)
+def _score_ledger_df(pos_df: pd.DataFrame, cfg: dict[str, Any], skipped_activity: bool = False) -> dict[str, Any]:
     if pos_df.empty:
         return {
             "s3_verdict": "❌ KHÔNG DỮ LIỆU",
@@ -929,21 +921,18 @@ def _audit_single_wallet_step3(
             "penny_pct": 0.0,
             "pnl_ex_top5": 0.0,
             "top20_roi_pct": 0.0,
-            "med_size_usdc": 0.0,
             "med_buys": 0.0,
-            "med_accum_h": 0.0,
             "gradual_pct": 0.0,
             "hedged_pct": 0.0,
             "open_live_unreal": 0.0,
-            "s3_flags": "Không tải được sổ cái vị thế",
-        }, pos_df
+            "s3_flags": "Không có dữ liệu vị thế hợp lệ",
+        }
 
     n_pos = len(pos_df)
     total_cost = float(pos_df["true_cost"].sum())
     net_pnl = float(pos_df["total_pnl"].sum())
     true_roi = (net_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
 
-    # Win rate & Capital-weighted Edge + Variance-weighted Z-score
     count_wr = float(pos_df["real_win"].mean() * 100.0)
     cap_wr = float(pos_df.loc[pos_df["real_win"], "true_cost"].sum() / total_cost * 100.0) if total_cost > 0 else 0.0
     w_entry = float((pos_df["avg_price"] * pos_df["true_cost"]).sum() / total_cost * 100.0) if total_cost > 0 else 0.0
@@ -957,7 +946,6 @@ def _audit_single_wallet_step3(
     else:
         z_score = 0.0
 
-    # Phân rã Exit Style CHỈ trên tập vị thế đã ngã ngũ & khớp Activity (chống ảo phân trang)
     matched_settled = pos_df[pos_df["exit_style"].isin(["HOLD_TO_EXPIRY", "SOLD_EARLY", "PARTIAL_SELL"])]
     act_matched_only = pos_df[pos_df["has_act_match"] & (pos_df["status"] != "OPEN")]
 
@@ -975,23 +963,19 @@ def _audit_single_wallet_step3(
     elif matched_net_pnl > 0:
         hold_pnl_share = max(-100.0, min(100.0, hold_pnl / matched_net_pnl * 100.0))
     else:
-        # Nếu cụm gần nhất hòa/lỗ: đo trên tổng lãi dương của HOLD vs SOLD_EARLY
         pos_hold = float(hold_df.loc[hold_df["total_pnl"] > 0, "total_pnl"].sum())
         pos_early = float(early_df.loc[early_df["total_pnl"] > 0, "total_pnl"].sum())
         tot_pos = pos_hold + pos_early
         hold_pnl_share = (pos_hold / tot_pos * 100.0) if tot_pos > 0 else 0.0
 
-    # Vi cấu trúc gom lệnh (chống Instant Sweep kiểu chonkvision) trên các kèo có BUY trong activity
     buy_matched = pos_df[pos_df["buy_count"] > 0]
     med_buys = float(buy_matched["buy_count"].median()) if not buy_matched.empty else 0.0
-    med_accum_h = float(buy_matched["accum_hours"].median()) if not buy_matched.empty else 0.0
     gradual_pct = (
         float(((buy_matched["buy_count"] > 3) & (buy_matched["accum_hours"] > 0.033)).mean() * 100.0)
         if not buy_matched.empty
         else 0.0
     )
 
-    # Phân bổ vốn theo dải xác suất (chặn Weather >=95¢ & Penny <10¢)
     core_band_cost = float(pos_df[(pos_df["avg_price"] >= 0.20) & (pos_df["avg_price"] <= 0.85)]["true_cost"].sum())
     high_fav_cost = float(pos_df[pos_df["avg_price"] >= 0.95]["true_cost"].sum())
     penny_cost = float(pos_df[pos_df["avg_price"] < 0.10]["true_cost"].sum())
@@ -1000,27 +984,21 @@ def _audit_single_wallet_step3(
     high_fav_pct = (high_fav_cost / total_cost * 100.0) if total_cost > 0 else 0.0
     penny_pct = (penny_cost / total_cost * 100.0) if total_cost > 0 else 0.0
 
-    # Độ bền vững Outlier (PnL ex-Top 5 theo từng condition_id)
     mkt_pnls = pos_df.groupby(np.where(pos_df["condition_id"] != "", pos_df["condition_id"], pos_df["token_id"]))["total_pnl"].sum()
     top5_sum = float(mkt_pnls[mkt_pnls > 0].sort_values(ascending=False).head(5).sum())
     pnl_ex_top5 = net_pnl - top5_sum
 
-    # Kỷ luật nhồi tiền (Top 20% size vs Bottom 50% size)
     q80 = pos_df["true_cost"].quantile(0.80)
     q50 = pos_df["true_cost"].quantile(0.50)
     top20_df = pos_df[pos_df["true_cost"] >= q80]
     bot50_df = pos_df[pos_df["true_cost"] <= q50]
     top20_roi = (float(top20_df["total_pnl"].sum()) / float(top20_df["true_cost"].sum()) * 100.0) if float(top20_df["true_cost"].sum()) > 0 else 0.0
     bot50_roi = (float(bot50_df["total_pnl"].sum()) / float(bot50_df["true_cost"].sum()) * 100.0) if float(bot50_df["true_cost"].sum()) > 0 else 0.0
-
-    med_size = float(pos_df["true_cost"].median())
     hedged_pct = float(pos_df["is_hedged"].mean() * 100.0)
 
-    # ================= CHẤM ĐIỂM COPYABILITY (0 - 100) & CẮM CỜ =================
     flags: list[str] = []
     score = 0
 
-    # 1. True ROI 1 chiều (20đ)
     if true_roi >= float(cfg["min_true_roi"]):
         score += 20
     else:
@@ -1029,58 +1007,53 @@ def _audit_single_wallet_step3(
     if open_live_unreal < -0.25 * max(abs(net_pnl), 2000.0):
         flags.append(f"Đang gồng lỗ OPEN (${open_live_unreal:+,.0f})")
 
-    # 2. Edge thống kê: CapEdge & Z-score (25đ)
     if cap_edge >= float(cfg["min_cap_edge"]) and z_score >= float(cfg["min_z_score"]):
         score += 25
     elif cap_edge >= float(cfg["min_cap_edge"]) * 0.65 and z_score >= 1.28:
         score += 12
         flags.append(f"Edge/Z trung bình (Edge {cap_edge:+.1f}%, Z={z_score:.2f})")
     else:
-        flags.append(f"Thiếu Edge thống kê (CapEdge {cap_edge:+.1f}%, Z={z_score:.2f})")
+        flags.append(f"Thiếu Edge (CapEdge {cap_edge:+.1f}%, Z={z_score:.2f})")
 
-    # 3. Hold-to-Expiry REDEEM Dominance — Chặn bẫy dybas SOLD_EARLY (20đ)
-    if hold_pnl_share >= float(cfg["min_hold_redeem"]):
+    if skipped_activity:
+        flags.append("Dừng sớm Chặng 3A (không kéo Activity)")
+    elif hold_pnl_share >= float(cfg["min_hold_redeem"]):
         score += 20
     else:
-        flags.append(f"Lãi phụ thuộc bán non (Hold={hold_pnl_share:.0f}% < {cfg['min_hold_redeem']:.0f}%, Early=${early_pnl:+,.0f})")
+        flags.append(f"Lãi bán non (Hold={hold_pnl_share:.0f}% < {cfg['min_hold_redeem']:.0f}%, Early=${early_pnl:+,.0f})")
 
-    # 4. Dải xác suất an toàn 20–85% — Chặn Weather 99¢ & vé số <10¢ (15đ)
-    if (
-        core_band_pct >= float(cfg["min_core_band"])
-        and high_fav_pct <= float(cfg["max_high_fav"])
-        and penny_pct <= 20.0
-    ):
+    if core_band_pct >= float(cfg["min_core_band"]) and high_fav_pct <= float(cfg["max_high_fav"]) and penny_pct <= 20.0:
         score += 15
     else:
         if high_fav_pct > float(cfg["max_high_fav"]):
-            flags.append(f"Bẫy Maker/Fav >=95¢ ({high_fav_pct:.1f}% vốn)")
+            flags.append(f"Bẫy Fav >=95¢ ({high_fav_pct:.1f}%)")
         if penny_pct > 20.0:
-            flags.append(f"Đánh vé số <10¢ cao ({penny_pct:.1f}% vốn)")
+            flags.append(f"Vé số <10¢ ({penny_pct:.1f}%)")
         if core_band_pct < float(cfg["min_core_band"]):
-            flags.append(f"Vốn dải 20-85% thấp ({core_band_pct:.1f}% < {cfg['min_core_band']:.0f}%)")
+            flags.append(f"Vốn 20-85% thấp ({core_band_pct:.1f}%)")
 
-    # 5. Độ bền vững ex-Top 5 & Kỷ luật nhồi tiền (15đ)
     if pnl_ex_top5 > 0:
         score += 8
     elif bool(cfg["require_ex_top5"]):
-        flags.append(f"Phụ thuộc Top 5 kèo (ex-Top 5 = ${pnl_ex_top5:+,.0f})")
+        flags.append(f"Phụ thuộc Top 5 (ex-Top 5=${pnl_ex_top5:+,.0f})")
 
     if (cap_wr + 1.5 >= count_wr) and (top20_roi >= bot50_roi - 2.0):
         score += 7
     else:
-        flags.append(f"Nhồi tiền kém (CapWR {cap_wr:.1f}% vs WR {count_wr:.1f}%, Top20% ROI {top20_roi:+.1f}%)")
+        flags.append(f"Nhồi tiền kém (CapWR {cap_wr:.1f}% vs WR {count_wr:.1f}%)")
 
-    # 6. Điểm thưởng gom lệnh từ từ — Chặn Instant Sweep kiểu chonkvision (5đ)
-    if gradual_pct >= 30.0 or med_buys >= 4.0:
-        score += 5
-    else:
-        flags.append(f"Gom lệnh quá nhanh/1 phát (MedBuys={med_buys:.1f}, Gradual={gradual_pct:.0f}%)")
+    if not skipped_activity:
+        if gradual_pct >= 30.0 or med_buys >= 4.0:
+            score += 5
+        else:
+            flags.append(f"Gom nhanh (MedBuys={med_buys:.1f}, Gradual={gradual_pct:.0f}%)")
 
     if hedged_pct > 20.0:
         flags.append(f"Hedge 2 đầu cao ({hedged_pct:.1f}%)")
 
     critical_fail = (
-        true_roi < float(cfg["min_true_roi"])
+        skipped_activity
+        or true_roi < float(cfg["min_true_roi"])
         or cap_edge < float(cfg["min_cap_edge"]) * 0.65
         or hold_pnl_share < float(cfg["min_hold_redeem"])
         or high_fav_pct > float(cfg["max_high_fav"])
@@ -1090,14 +1063,14 @@ def _audit_single_wallet_step3(
     if score >= 80 and not critical_fail:
         verdict = "🏆 CHUẨN PRO COPY"
         passed = True
-    elif score >= 60:
+    elif score >= 60 and not skipped_activity:
         verdict = "🟡 THEO DÕI THÊM"
         passed = False
     else:
-        verdict = "❌ LOẠI (Sổ cái)"
+        verdict = "❌ LOẠI (3A Sớm)" if skipped_activity else "❌ LOẠI (Sổ cái)"
         passed = False
 
-    summary = {
+    return {
         "s3_verdict": verdict,
         "s3_passed": passed,
         "copy_score": score,
@@ -1111,30 +1084,32 @@ def _audit_single_wallet_step3(
         "cap_edge_pct": round(cap_edge, 2),
         "z_score": round(z_score, 2),
         "hold_pnl_share_pct": round(hold_pnl_share, 1),
-        "act_match_info": f"{len(act_matched_only)}/{n_pos}",
+        "act_match_info": "Dừng 3A" if skipped_activity else f"{len(act_matched_only)}/{n_pos}",
         "core_band_pct": round(core_band_pct, 1),
         "high_fav_pct": round(high_fav_pct, 1),
         "penny_pct": round(penny_pct, 1),
         "pnl_ex_top5": round(pnl_ex_top5, 2),
         "top20_roi_pct": round(top20_roi, 1),
-        "med_size_usdc": round(med_size, 1),
         "med_buys": round(med_buys, 1),
-        "med_accum_h": round(med_accum_h, 2),
         "gradual_pct": round(gradual_pct, 0),
         "hedged_pct": round(hedged_pct, 1),
         "open_live_unreal": round(open_live_unreal, 2),
         "s3_flags": " | ".join(flags) if flags else "Sạch lỗi — Đạt toàn bộ DNA ví CS2",
     }
-    return summary, pos_df
 
 
 def step3_deep_ledger_audit(
     df_step2_passed: pd.DataFrame,
     cfg: dict[str, Any],
+    wallet_cache: dict[str, dict[str, Any]],
+    activity_cache: dict[str, list[dict[str, Any]]],
+    progress_cb=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame], dict[str, Any]]:
     """
-    Bước 3: Chạy kiểm toán sổ cái chuyên sâu (4 luồng song song) cho nhóm ví đạt Bước 2.
-    Trả về: (df_final_pros, df_step3_all, details_map_by_wallet, stats_log).
+    Bước 3 siêu tốc 2 chặng:
+      - Chặng 3A (0ms mạng): Chấm sơ bộ trên raw_positions đã tải từ Bước 2.
+        Ví nào rớt nặng (high_fav, pnl_ex_top5 <= 0, true_roi âm/thấp, cap_edge thấp) -> DỪNG SỚM.
+      - Chặng 3B: Chỉ kéo /v2/activity cho nhóm ứng viên sống sót qua Chặng 3A.
     """
     t0 = time.perf_counter()
     if df_step2_passed.empty:
@@ -1142,59 +1117,66 @@ def step3_deep_ledger_audit(
             df_step2_passed.copy(),
             df_step2_passed.copy(),
             {},
-            {"elapsed_s": 0.0, "input_count": 0, "passed_count": 0, "watch_count": 0},
+            {"elapsed_s": 0.0, "input_count": 0, "stage3b_count": 0, "passed_count": 0, "watch_count": 0},
         )
 
     work_df = df_step2_passed.copy()
     wallets = [str(w).strip().lower() for w in work_df["wallet"].tolist()]
-
-    max_pos_pages = int(cfg["max_pos_pages"])
     max_act_pages = int(cfg["max_act_pages"])
 
     audit_map: dict[str, dict[str, Any]] = {}
     details_map: dict[str, pd.DataFrame] = {}
+    stage3b_candidates: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        fut_to_w = {
-            executor.submit(_audit_single_wallet_step3, w, cfg, max_pos_pages, max_act_pages): w
-            for w in wallets
-        }
-        for fut in as_completed(fut_to_w):
-            w = fut_to_w[fut]
-            try:
-                summary, pos_df = fut.result()
-                audit_map[w] = summary
-                if not pos_df.empty:
-                    details_map[w] = pos_df
-            except Exception as exc:
-                audit_map[w] = {
-                    "s3_verdict": "⚠️ LỖI API B3",
-                    "s3_passed": False,
-                    "copy_score": 0,
-                    "audit_pos_cnt": 0,
-                    "true_cost_usdc": 0.0,
-                    "ledger_pnl_usdc": 0.0,
-                    "true_roi_pct": 0.0,
-                    "count_wr_pct": 0.0,
-                    "cap_wr_pct": 0.0,
-                    "w_entry_pct": 0.0,
-                    "cap_edge_pct": 0.0,
-                    "z_score": 0.0,
-                    "hold_pnl_share_pct": 0.0,
-                    "act_match_info": "0/0",
-                    "core_band_pct": 0.0,
-                    "high_fav_pct": 0.0,
-                    "penny_pct": 0.0,
-                    "pnl_ex_top5": 0.0,
-                    "top20_roi_pct": 0.0,
-                    "med_size_usdc": 0.0,
-                    "med_buys": 0.0,
-                    "med_accum_h": 0.0,
-                    "gradual_pct": 0.0,
-                    "hedged_pct": 0.0,
-                    "open_live_unreal": 0.0,
-                    "s3_flags": f"Lỗi tải sổ cái: {exc}",
-                }
+    # CHẶNG 3A: Chạy CPU thuần trên raw_positions có sẵn từ Bước 2
+    for w in wallets:
+        cached = wallet_cache.get(w, {})
+        raw_pos = cached.get("raw_positions") or []
+        seed_acts = cached.get("seed_acts") or []
+
+        pre_df = _build_ledger_from_raw(raw_pos, seed_acts)
+        pre_score = _score_ledger_df(pre_df, cfg, skipped_activity=True)
+
+        # Chỉ cho qua Chặng 3B (kéo Activity) nếu không dính lỗi chí mạng ở sổ vị thế
+        fail_hard_3a = (
+            pre_df.empty
+            or pre_score["high_fav_pct"] > float(cfg["max_high_fav"]) + 5.0
+            or pre_score["core_band_pct"] < float(cfg["min_core_band"]) - 15.0
+            or pre_score["true_roi_pct"] < float(cfg["min_true_roi"]) * 0.4
+            or (bool(cfg["require_ex_top5"]) and pre_score["pnl_ex_top5"] <= 0)
+        )
+
+        if fail_hard_3a:
+            audit_map[w] = pre_score
+            if not pre_df.empty:
+                details_map[w] = pre_df
+        else:
+            stage3b_candidates.append(w)
+
+    # CHẶNG 3B: Kéo /v2/activity song song (4 luồng) CHỈ cho nhóm sáng giá chưa có trong activity_cache
+    to_fetch_act = [w for w in stage3b_candidates if w not in activity_cache]
+    done_3b = len(stage3b_candidates) - len(to_fetch_act)
+
+    if to_fetch_act:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            fut_to_w = {executor.submit(_fetch_activities_v2, w, max_act_pages): w for w in to_fetch_act}
+            for fut in as_completed(fut_to_w):
+                w = fut_to_w[fut]
+                try:
+                    activity_cache[w] = fut.result()
+                except Exception:
+                    activity_cache[w] = wallet_cache.get(w, {}).get("seed_acts") or []
+                done_3b += 1
+                if progress_cb:
+                    progress_cb(done_3b, len(stage3b_candidates))
+
+    for w in stage3b_candidates:
+        raw_pos = wallet_cache.get(w, {}).get("raw_positions") or []
+        full_acts = activity_cache.get(w) or wallet_cache.get(w, {}).get("seed_acts") or []
+        full_df = _build_ledger_from_raw(raw_pos, full_acts)
+        audit_map[w] = _score_ledger_df(full_df, cfg, skipped_activity=False)
+        if not full_df.empty:
+            details_map[w] = full_df
 
     attach_cols = list(next(iter(audit_map.values())).keys())
     for c in attach_cols:
@@ -1216,6 +1198,7 @@ def step3_deep_ledger_audit(
         {
             "elapsed_s": elapsed,
             "input_count": len(work_df),
+            "stage3b_count": len(stage3b_candidates),
             "passed_count": len(df_final),
             "watch_count": watch_cnt,
         },
@@ -1223,20 +1206,33 @@ def step3_deep_ledger_audit(
 
 
 # ==============================================================================
-# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN FULL PIPELINE 3 BƯỚC + X-RAY
+# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN FULL PIPELINE 3 BƯỚC TỐI ƯU
 # ==============================================================================
 
-st.title("📡 Polymarket Pro Wallet Finder — Full 3-Step Pipeline")
+st.title("📡 Polymarket Pro Wallet Finder — Fast 3-Step Pipeline")
 st.caption(
-    "**Bước 1:** Thu thập Top N ví Leaderboard → "
-    "**Bước 2:** Lọc bề mặt, tách CLOSED / OPEN & khóa độ tươi → "
-    "**Bước 3:** Kiểm toán sổ cái 4 trạng thái, chấm điểm Copy-Trade & Soi X-Ray."
+    "**Bước 1:** Kéo Leaderboard theo lô an toàn → "
+    "**Bước 2:** Lọc bề mặt & cache sổ vị thế → "
+    "**Bước 3:** Chặn sớm Chặng 3A (0ms mạng) & chỉ kéo Activity cho ứng viên sáng giá."
 )
 
 s1, s2, s3 = st.columns(3)
-s1.success("✅ **Bước 1: Thu thập Top N ví**\n\nLeaderboard v2 (< 1 giây)")
-s2.success("✅ **Bước 2: Lọc Bề mặt & Độ tươi**\n\nTách CLOSED vs xác 0¢ (8 luồng)")
-s3.success("✅ **Bước 3: Kiểm toán Sổ cái Sâu**\n\nTrue ROI, CapEdge, REDEEM, X-Ray (4 luồng)")
+s1.success("✅ **Bước 1: Thu thập Leaderboard**\n\nChia lô an toàn 20/trang + Log lỗi rõ")
+s2.success("✅ **Bước 2: Lọc & Cache Positions**\n\nKhông tải trùng lặp sang Bước 3")
+s3.success("✅ **Bước 3: Sổ cái 2 Chặng + X-Ray**\n\nDừng sớm 3A, lọc lại từ Cache < 0.1s")
+
+for key, default_val in [
+    ("df_step1_raw", pd.DataFrame()),
+    ("df_final_pros", pd.DataFrame()),
+    ("df_step3_all", pd.DataFrame()),
+    ("df_step2_all", pd.DataFrame()),
+    ("step3_details_map", {}),
+    ("wallet_cache", {}),
+    ("activity_cache", {}),
+    ("pipeline_meta", {}),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default_val
 
 with st.sidebar:
     st.header("⚙️ Ngưỡng Lọc Bước 2 (Bề mặt)")
@@ -1247,14 +1243,7 @@ with st.sidebar:
     min_markets = c_m1.number_input("3. Kèo đóng tối thiểu", min_value=1, max_value=500, value=80, step=10)
     max_markets = c_m2.number_input("4. Kèo đóng tối đa", min_value=50, max_value=10000, value=3500, step=250)
 
-    max_dead_open = st.number_input(
-        "5. Trần xác vị thế 0¢ tối đa",
-        min_value=0,
-        max_value=5000,
-        value=1000,
-        step=100,
-        help="Các xác 0¢ chưa claim sẽ tự động được Bước 3 hạch toán vào nhóm thua SETTLED_LOSS_0C.",
-    )
+    max_dead_open = st.number_input("5. Trần xác vị thế 0¢ tối đa", min_value=0, max_value=5000, value=1000, step=100)
     max_inactive_days = st.slider("6. Ngừng chạy tối đa (ngày)", 1, 90, 30, 1)
     allow_live_open_override = st.checkbox("Giữ ví nếu đang có lệnh OPEN sống (> $1)", value=True)
 
@@ -1267,10 +1256,15 @@ with st.sidebar:
     min_core_band = st.slider("11. % Vốn dải 20%–85%", 40.0, 95.0, 70.0, 5.0)
     max_high_fav = st.slider("12. Trần vốn dải >=95¢ (%)", 0.0, 30.0, 10.0, 2.0)
     require_ex_top5 = st.checkbox("13. Bắt buộc PnL ex-Top 5 > $0", value=True)
+    max_act_pages = st.slider("Trang Activity tối đa (×500)", 2, 10, 4, 1)
 
-    c_p1, c_p2 = st.columns(2)
-    max_pos_pages = c_p1.number_input("Trang Pos (×500)", 2, 20, 10, 2)
-    max_act_pages = c_p2.number_input("Trang Act (×500)", 2, 20, 8, 2)
+    if st.session_state["wallet_cache"]:
+        st.divider()
+        st.caption(f"💾 Đang cache dữ liệu của **{len(st.session_state['wallet_cache'])}** ví.")
+        if st.button("🧹 Xóa Cache API", use_container_width=True):
+            st.session_state["wallet_cache"] = {}
+            st.session_state["activity_cache"] = {}
+            st.rerun()
 
 step2_cfg = {
     "min_pv_pct": min_pv_pct,
@@ -1290,79 +1284,93 @@ step3_cfg = {
     "min_core_band": min_core_band,
     "max_high_fav": max_high_fav,
     "require_ex_top5": require_ex_top5,
-    "max_pos_pages": max_pos_pages,
     "max_act_pages": max_act_pages,
 }
 
 st.divider()
 
 c1, c2, c3, c4 = st.columns([2.2, 1.4, 1.2, 1.0])
-
-selected_cat_label = c1.selectbox(
-    "Chọn Category",
-    options=list(CATEGORY_OPTIONS.keys()),
-    index=0,
-)
-selected_range_label = c2.selectbox(
-    "Chọn Range (Khung thời gian)",
-    options=list(RANGE_OPTIONS.keys()),
-    index=2,
-)
-selected_order = c3.selectbox(
-    "Xếp hạng theo",
-    options=["PNL", "VOL"],
-    index=0,
-)
-selected_top_n = c4.number_input(
-    "Số lượng ví (Top N)",
-    min_value=10,
-    max_value=100,
-    value=40,
-    step=10,
-)
+selected_cat_label = c1.selectbox("Chọn Category", options=list(CATEGORY_OPTIONS.keys()), index=0)
+selected_range_label = c2.selectbox("Chọn Range (Khung thời gian)", options=list(RANGE_OPTIONS.keys()), index=2)
+selected_order = c3.selectbox("Xếp hạng theo", options=["PNL", "VOL"], index=0)
+selected_top_n = c4.number_input("Số lượng ví (Top N)", min_value=10, max_value=100, value=40, step=10)
 
 cat_code = CATEGORY_OPTIONS[selected_cat_label]
 range_code = RANGE_OPTIONS[selected_range_label]
 
-run_clicked = st.button(
-    f"🚀 CHẠY FULL PIPELINE 3 BƯỚC ({cat_code} • {range_code.upper()} • TOP {int(selected_top_n)})",
+b1, b2 = st.columns([3, 1.4])
+run_clicked = b1.button(
+    f"🚀 QUÉT MỚI FULL 3 BƯỚC ({cat_code} • {range_code.upper()} • TOP {int(selected_top_n)})",
     type="primary",
     use_container_width=True,
 )
+recalc_clicked = b2.button(
+    "⚡ Lọc lại từ Cache (< 0.1s)",
+    use_container_width=True,
+    disabled=st.session_state["df_step1_raw"].empty,
+)
 
-for key, default_val in [
-    ("df_final_pros", pd.DataFrame()),
-    ("df_step3_all", pd.DataFrame()),
-    ("df_step2_all", pd.DataFrame()),
-    ("step3_details_map", {}),
-    ("pipeline_meta", {}),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default_val
+
+def _execute_steps_2_3(df_s1: pd.DataFrame, meta: dict[str, Any]) -> None:
+    pbar = st.progress(0.05, text="⏳ Đang chạy Bước 2: Thăm dò & cache sổ vị thế...")
+
+    def cb_s2(done: int, total: int):
+        pct = 0.05 + 0.55 * (done / max(1, total))
+        pbar.progress(min(0.60, pct), text=f"⏳ Bước 2: Đã tải sổ vị thế {done}/{total} ví...")
+
+    df_s2_passed, df_s2_all, s2_stats = step2_surface_filter(
+        df_s1, cfg=step2_cfg, wallet_cache=st.session_state["wallet_cache"], progress_cb=cb_s2
+    )
+
+    pbar.progress(0.65, text=f"🔬 Bước 3A: Đang chấm điểm nhanh {len(df_s2_passed)} ví trên Positions cache...")
+
+    def cb_s3(done: int, total: int):
+        pct = 0.65 + 0.33 * (done / max(1, total))
+        pbar.progress(min(0.98, pct), text=f"🔬 Bước 3B: Đang kéo Activity chuyên sâu cho {done}/{total} ứng viên sáng giá...")
+
+    df_final_pros, df_s3_all, details_map, s3_stats = step3_deep_ledger_audit(
+        df_s2_passed,
+        cfg=step3_cfg,
+        wallet_cache=st.session_state["wallet_cache"],
+        activity_cache=st.session_state["activity_cache"],
+        progress_cb=cb_s3,
+    )
+    pbar.progress(1.0, text="✅ Hoàn tất toàn bộ 3 bước!")
+    time.sleep(0.2)
+    pbar.empty()
+
+    meta["step2_stats"] = s2_stats
+    meta["step3_stats"] = s3_stats
+
+    st.session_state["df_final_pros"] = df_final_pros
+    st.session_state["df_step3_all"] = df_s3_all
+    st.session_state["df_step2_all"] = df_s2_all
+    st.session_state["step3_details_map"] = details_map
+    st.session_state["pipeline_meta"] = meta
+
 
 if run_clicked:
-    with st.spinner(f"Đang chạy Bước 1 → Bước 2 → Bước 3 cho Top {int(selected_top_n)} ví ({cat_code})..."):
-        t_start = time.perf_counter()
+    t_start = time.perf_counter()
+    with st.spinner(f"Đang thực thi Bước 1: Kéo Top {int(selected_top_n)} ví ({cat_code} • {range_code})..."):
         df_step1, meta = step1_fetch_leaderboard(
             category=cat_code,
             time_period=range_code,
             order_by=selected_order,
             top_n=int(selected_top_n),
         )
-        t_step1 = round(time.perf_counter() - t_start, 2)
+    meta["step1_elapsed_s"] = round(time.perf_counter() - t_start, 2)
+    st.session_state["df_step1_raw"] = df_step1
 
-        df_step2_passed, df_step2_all, s2_stats = step2_surface_filter(df_step1, cfg=step2_cfg)
-        df_final_pros, df_step3_all, details_map, s3_stats = step3_deep_ledger_audit(df_step2_passed, cfg=step3_cfg)
-
-        meta["step1_elapsed_s"] = t_step1
-        meta["step2_stats"] = s2_stats
-        meta["step3_stats"] = s3_stats
-
-        st.session_state["df_final_pros"] = df_final_pros
-        st.session_state["df_step3_all"] = df_step3_all
-        st.session_state["df_step2_all"] = df_step2_all
-        st.session_state["step3_details_map"] = details_map
+    if df_step1.empty:
+        st.session_state["df_step2_all"] = pd.DataFrame()
+        st.session_state["df_step3_all"] = pd.DataFrame()
+        st.session_state["df_final_pros"] = pd.DataFrame()
         st.session_state["pipeline_meta"] = meta
+    else:
+        _execute_steps_2_3(df_step1, meta)
+
+elif recalc_clicked and not st.session_state["df_step1_raw"].empty:
+    _execute_steps_2_3(st.session_state["df_step1_raw"], dict(st.session_state["pipeline_meta"]))
 
 meta_res: dict[str, Any] = st.session_state["pipeline_meta"]
 df_final: pd.DataFrame = st.session_state["df_final_pros"]
@@ -1372,35 +1380,26 @@ details_map: dict[str, pd.DataFrame] = st.session_state["step3_details_map"]
 
 if meta_res:
     if df_s2_all.empty:
-        st.error(f"Không thu thập được dữ liệu từ API. Chi tiết lỗi: {meta_res.get('errors')}")
+        st.error(
+            f"Bước 1 không thu thập được dữ liệu ví nào từ `{meta_res.get('endpoint')}`.\n\n"
+            f"- **Errors:** `{meta_res.get('errors')}`\n"
+            f"- **Debug response:** `{meta_res.get('debug_notes')}`"
+        )
     else:
         s2_stats = meta_res.get("step2_stats", {})
         s3_stats = meta_res.get("step3_stats", {})
         st.divider()
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric(
-            "Bước 1 (Leaderboard)",
-            f"{s2_stats.get('input_count', 0)} ví",
-            f"{meta_res.get('step1_elapsed_s', 0)}s",
-        )
-        m2.metric(
-            "Bước 2 (Đạt sàng lọc)",
-            f"{s2_stats.get('passed_count', 0)} ví",
-            f"Lọc mất {s2_stats.get('elapsed_s', 0)}s",
-        )
+        m1.metric("Bước 1 (Leaderboard)", f"{s2_stats.get('input_count', 0)} ví", f"{meta_res.get('step1_elapsed_s', 0)}s")
+        m2.metric("Bước 2 (Đạt sàng lọc)", f"{s2_stats.get('passed_count', 0)} ví", f"{s2_stats.get('elapsed_s', 0)}s")
         m3.metric(
-            "🏆 CHUẨN PRO (Bước 3)",
-            f"{s3_stats.get('passed_count', 0)} ví",
-            f"Theo dõi thêm: {s3_stats.get('watch_count', 0)} ví",
+            "Bước 3B (Kéo Activity)",
+            f"{s3_stats.get('stage3b_count', 0)}/{s3_stats.get('input_count', 0)} ví",
+            f"Dừng sớm {s3_stats.get('input_count', 0) - s3_stats.get('stage3b_count', 0)} ví ở 3A",
         )
-        m4.metric(
-            "Thời gian Bước 3",
-            f"{s3_stats.get('elapsed_s', 0)}s",
-            f"Kiểm toán {s3_stats.get('input_count', 0)} ví",
-        )
+        m4.metric("🏆 CHUẨN PRO", f"{s3_stats.get('passed_count', 0)} ví", f"B3: {s3_stats.get('elapsed_s', 0)}s • Theo dõi: {s3_stats.get('watch_count', 0)}")
 
-        # ==================== BẢNG KẾT QUẢ BƯỚC 3 ====================
         s3_col_cfg = {
             "rank": st.column_config.NumberColumn("Hạng LB", format="#%d", width="small"),
             "s3_verdict": st.column_config.TextColumn("Kết luận B3", width="medium"),
@@ -1430,17 +1429,12 @@ if meta_res:
         if df_s3_all.empty:
             st.warning("Không có ví nào vượt qua Bước 2 để đưa vào Bước 3.")
         else:
-            st.dataframe(
-                df_s3_all[s3_cols],
-                use_container_width=True,
-                hide_index=True,
-                column_config=s3_col_cfg,
-            )
+            st.dataframe(df_s3_all[s3_cols], use_container_width=True, hide_index=True, column_config=s3_col_cfg)
 
-        # ==================== TRÌNH SOI SÂU X-RAY (0ms TỪ CACHE BƯỚC 3) ====================
+        # ==================== TRÌNH SOI SÂU X-RAY ====================
         if not df_s3_all.empty and details_map:
             st.divider()
-            st.subheader("🔬 Soi Sâu X-Ray Từng Ví (Đọc trực tiếp từ Sổ cái Bước 3)")
+            st.subheader("🔬 Soi Sâu X-Ray Từng Ví (Đọc tức thì từ Cache)")
 
             label_to_wallet: dict[str, str] = {}
             for _, r in df_s3_all.iterrows():
@@ -1453,9 +1447,7 @@ if meta_res:
                 picked_lbl = st.selectbox("Chọn ví cần giải phẫu chi tiết:", options=list(label_to_wallet.keys()))
                 picked_w = label_to_wallet[picked_lbl]
                 pos_x = details_map[picked_w].copy()
-
                 tot_c = float(pos_x["true_cost"].sum())
-                tot_p = float(pos_x["total_pnl"].sum())
 
                 x_left, x_right = st.columns(2)
                 with x_left:
@@ -1501,7 +1493,7 @@ if meta_res:
                         )
                     st.dataframe(pd.DataFrame(b_rows), use_container_width=True, hide_index=True)
 
-                st.markdown("**3. Kỷ luật đi tiền theo Quy mô kèo của chính ví này (Conviction Sizing)**")
+                st.markdown("**3. Kỷ luật đi tiền theo Quy mô kèo (Conviction Sizing)**")
                 q50 = pos_x["true_cost"].quantile(0.50)
                 q80 = pos_x["true_cost"].quantile(0.80)
                 pos_x["size_tier"] = np.where(
@@ -1536,13 +1528,13 @@ if meta_res:
                 ]
                 avail_ex = [c for c in export_pos_cols if c in pos_x.columns]
                 st.download_button(
-                    f"📥 Tải toàn bộ lịch sử sổ cái sạch của `{picked_w[:10]}...` (CSV)",
+                    f"📥 Tải lịch sử sổ cái sạch của `{picked_w[:10]}...` (CSV)",
                     data=pos_x[avail_ex].to_csv(index=False).encode("utf-8-sig"),
                     file_name=f"xray_{picked_w[:10]}.csv",
                     mime="text/csv",
                 )
 
-        # ==================== BẢNG PHỄU BƯỚC 2 (THU GỌN) ====================
+        # ==================== BẢNG PHỄU BƯỚC 2 ====================
         s2_col_cfg = {
             "rank": st.column_config.NumberColumn("Hạng LB", format="#%d", width="small"),
             "step2_status": st.column_config.TextColumn("Trạng thái B2", width="medium"),
