@@ -64,7 +64,7 @@ def get_http_session() -> requests.Session:
         sess.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "Polymarket-Wallet-Finder/5.0-4Pillars",
+                "User-Agent": "Polymarket-Wallet-Finder/5.1-4Pillars",
             }
         )
         _THREAD_LOCAL.session = sess
@@ -197,7 +197,11 @@ def _extract_batch_and_cursor(payload: Any) -> tuple[list[dict[str, Any]], str |
             or []
         )
         pagination = payload.get("pagination") or {}
-        next_cursor = pagination.get("next_cursor") or payload.get("next_cursor")
+        next_cursor = (
+            pagination.get("next_cursor")
+            or payload.get("next_cursor")
+            or payload.get("cursor")
+        )
         has_more = bool(pagination.get("has_more", bool(next_cursor)))
         return [r for r in batch if isinstance(r, dict)], next_cursor, has_more
     return [], None, False
@@ -212,18 +216,23 @@ def _fetch_positions_by_status(
     rows: list[dict[str, Any]] = []
     unique_cids: set[str] = set()
     cursor: str | None = None
+    seen_cursors: set[str] = set()
+    offset = 0
     capped = False
 
     for _ in range(max_pages):
         params: dict[str, Any] = {"user": wallet, "status": status_val, "limit": 500}
         if cursor:
             params["cursor"] = cursor
+        elif offset > 0:
+            params["offset"] = offset
+
         try:
             payload, _ = request_json_with_retry(POSITIONS_V2_URL, params=params, retries=2, timeout=10)
         except Exception:
             break
 
-        batch, cursor, has_more = _extract_batch_and_cursor(payload)
+        batch, next_cursor, has_more = _extract_batch_and_cursor(payload)
         if not batch:
             break
 
@@ -237,31 +246,74 @@ def _fetch_positions_by_status(
         if stop_cid_cap is not None and len(unique_cids) > stop_cid_cap:
             capped = True
             break
-        if not cursor or not has_more:
+
+        if next_cursor and has_more:
+            if next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        elif len(batch) >= 500:
+            cursor = None
+            offset += len(batch)
+        else:
             break
 
     return rows, capped
 
 
-def _fetch_activities_v2(wallet: str, max_pages: int = 6) -> list[dict[str, Any]]:
+def _fetch_activities_v2(wallet: str, max_pages: int = 8) -> list[dict[str, Any]]:
+    """Kéo lịch sử Activity hỗ trợ đầy đủ cả phân trang cursor lẫn offset fallback."""
     rows: list[dict[str, Any]] = []
     cursor: str | None = None
+    seen_cursors: set[str] = set()
+    seen_uids: set[str] = set()
+    offset = 0
+
     for _ in range(max_pages):
         params: dict[str, Any] = {"user": wallet, "limit": 500}
         if cursor:
             params["cursor"] = cursor
+        elif offset > 0:
+            params["offset"] = offset
+
         try:
             payload, _ = request_json_with_retry(ACTIVITY_V2_URL, params=params, retries=2, timeout=10)
         except Exception:
             break
 
-        batch, cursor, has_more = _extract_batch_and_cursor(payload)
+        batch, next_cursor, has_more = _extract_batch_and_cursor(payload)
         if not batch:
             break
 
-        rows.extend(batch)
-        if not cursor or not has_more:
+        added = 0
+        for r in batch:
+            uid = str(
+                r.get("id")
+                or r.get("transaction_hash")
+                or r.get("transactionHash")
+                or ""
+            ).strip()
+            if uid:
+                if uid in seen_uids:
+                    continue
+                seen_uids.add(uid)
+            rows.append(r)
+            added += 1
+
+        if added == 0:
             break
+
+        if next_cursor and has_more:
+            if next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        elif len(batch) >= 500:
+            cursor = None
+            offset += len(batch)
+        else:
+            break
+
     return rows
 
 
@@ -514,7 +566,7 @@ def _probe_and_cache_positions(wallet: str, max_settled_cap: int, max_dead_cap: 
             dead_zero_open_cnt += 1
 
     settled_cids: set[str] = set()
-    max_pages_closed = min(8, max(2, math.ceil((max_settled_cap + 200) / 500)))
+    max_pages_closed = min(10, max(2, math.ceil((max_settled_cap + 200) / 500)))
     closed_rows, settled_capped = _fetch_positions_by_status(
         wallet, "CLOSED", max_pages=max_pages_closed, stop_cid_cap=max_settled_cap
     )
@@ -714,7 +766,7 @@ def step2_surface_filter(
 
 
 # ==============================================================================
-# BƯỚC 3: KIỂM TOÁN 4 LƯỚI LỌC TINH GỌN (VÁ LỖI VỐN KÈO THẮNG CŨ)
+# BƯỚC 3: KIỂM TOÁN 4 LƯỚI LỌC TINH GỌN (ĐỒNG BỘ TẬP KÈO ĐÃ NGÃ NGŨ)
 # ==============================================================================
 
 def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str, Any]]) -> pd.DataFrame:
@@ -935,8 +987,11 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
         size_cost,
     )
 
-    # Đánh dấu vị thế có giá & vốn xác thực từ API/Activity (không bị khuyết avg_price)
-    pos_df["cost_verified"] = (explicit_cost > 0) | (valid_size_cost > 0) | ((pos_df["avg_price"] > 0.005) & (pos_df["avg_price"] < 0.995))
+    pos_df["cost_verified"] = (
+        (explicit_cost > 0)
+        | (valid_size_cost > 0)
+        | ((pos_df["avg_price"] > 0.005) & (pos_df["avg_price"] < 0.995))
+    )
 
     pos_df["true_cost"] = np.where(
         explicit_cost > 0,
@@ -970,7 +1025,7 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
         pos_df["true_cost"],
     )
     pos_df["roi_pct"] = pos_df["total_pnl"] / pos_df["true_cost"] * 100.0
-    pos_df["real_win"] = pos_df["total_pnl"] > 0
+    pos_df["real_win"] = (pos_df["status"] != "OPEN") & (pos_df["total_pnl"] > 0)
 
     cid_counts = pos_df[pos_df["condition_id"] != ""].groupby("condition_id")["outcome"].nunique()
     hedged_cids = set(cid_counts[cid_counts >= 2].index)
@@ -997,7 +1052,7 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
 
 
 def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_only: bool = False) -> dict[str, Any]:
-    """Đánh giá ví qua 4 Lưới Lọc Tinh Gọn (Chống Overfit, giữ chuẩn DNA ví CS2)."""
+    """Đánh giá ví qua 4 Lưới Lọc Tinh Gọn trên tập vị thế đã ngã ngũ (Chống lệch mẫu API & Overfit)."""
     if pos_df.empty:
         return {
             "s3_verdict": "❌ KHÔNG DỮ LIỆU",
@@ -1026,26 +1081,61 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
             "s3_flags": "Không có dữ liệu vị thế hợp lệ",
         }
 
-    n_pos = len(pos_df)
-    total_cost = float(pos_df["true_cost"].sum())
-    net_pnl = float(pos_df["total_pnl"].sum())
+    # Tách riêng tập vị thế ĐÃ NGÃ NGŨ (loại bỏ kèo OPEN đang chờ trận để không tính oan là thua)
+    settled_df = pos_df[pos_df["status"] != "OPEN"].copy()
+    if settled_df.empty:
+        return {
+            "s3_verdict": "⏳ CHƯA CÓ KÈO ĐÓNG",
+            "s3_passed": False,
+            "passed_gates_cnt": 0,
+            "gate_badge": "0/4 Lưới",
+            "audit_pos_cnt": 0,
+            "true_cost_usdc": 0.0,
+            "ledger_pnl_usdc": 0.0,
+            "true_roi_pct": 0.0,
+            "count_wr_pct": 0.0,
+            "cap_wr_pct": 0.0,
+            "w_entry_pct": 0.0,
+            "cap_edge_pct": 0.0,
+            "med_hold_h": 0.0,
+            "live_cap_pct": 0.0,
+            "big_single_shot_pct": 0.0,
+            "med_clip_usdc": 0.0,
+            "zero_sell_pct": 0.0,
+            "hold_pnl_share_pct": 0.0,
+            "act_match_info": f"0/{len(pos_df)} (OPEN)",
+            "core_band_pct": 0.0,
+            "high_fav_pct": 0.0,
+            "pnl_ex_top5": 0.0,
+            "hedged_cap_pct": 0.0,
+            "s3_flags": "Ví chỉ có vị thế đang OPEN, chưa có lịch sử đã ngã ngũ",
+        }
+
+    n_settled = len(settled_df)
+    total_cost = float(settled_df["true_cost"].sum())
+    net_pnl = float(settled_df["total_pnl"].sum())
     true_roi = (net_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
 
-    # Chỉ tính CapWR, W_Entry, CapEdge và Dải giá trên tập vị thế có giá/vốn xác thực (tránh méo do API cũ khuyết avg_price)
-    ver_df = pos_df[pos_df["cost_verified"]].copy()
-    if ver_df.empty:
-        ver_df = pos_df.copy()
+    # Đồng bộ 100% tập mẫu tính CapWR với True ROI trên toàn bộ vị thế đã ngã ngũ
+    count_wr = float(settled_df["real_win"].mean() * 100.0)
+    cap_wr = (
+        float(settled_df.loc[settled_df["real_win"], "true_cost"].sum() / total_cost * 100.0)
+        if total_cost > 0
+        else 0.0
+    )
 
-    ver_cost = float(ver_df["true_cost"].sum())
-    count_wr = float(pos_df["real_win"].mean() * 100.0)
-    cap_wr = float(ver_df.loc[ver_df["real_win"], "true_cost"].sum() / ver_cost * 100.0) if ver_cost > 0 else 0.0
-    priced_df = ver_df[ver_df["avg_price"] > 0.005]
+    # Giá mua TB & phân bổ dải xác suất tính trên các kèo đã ngã ngũ có giá xác thực (> 0.5¢)
+    priced_df = settled_df[settled_df["avg_price"] > 0.005]
     priced_cost = float(priced_df["true_cost"].sum())
-    w_entry = float((priced_df["avg_price"] * priced_df["true_cost"]).sum() / priced_cost * 100.0) if priced_cost > 0 else 50.0
+    w_entry = (
+        float((priced_df["avg_price"] * priced_df["true_cost"]).sum() / priced_cost * 100.0)
+        if priced_cost > 0
+        else 50.0
+    )
     cap_edge = cap_wr - w_entry
 
-    matched_settled = pos_df[pos_df["exit_style"].isin(["HOLD_TO_EXPIRY", "SOLD_EARLY", "PARTIAL_SELL"])]
-    act_matched_only = pos_df[pos_df["has_act_match"] & (pos_df["status"] != "OPEN")]
+    matched_settled = settled_df[settled_df["exit_style"].isin(["HOLD_TO_EXPIRY", "SOLD_EARLY", "PARTIAL_SELL"])]
+    act_matched_only = settled_df[settled_df["has_act_match"]]
 
     hold_df = matched_settled[matched_settled["exit_style"] == "HOLD_TO_EXPIRY"]
     early_df = matched_settled[matched_settled["exit_style"] == "SOLD_EARLY"]
@@ -1065,8 +1155,9 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
         hold_pnl_share = (pos_hold / tot_pos * 100.0) if tot_pos > 0 else 0.0
 
     # --- Lưới 1 & 2: Timing Pre-match, TWAP & Zero-Sell ---
+    act_matched_all = pos_df[pos_df["has_act_match"]]
     buy_matched = pos_df[pos_df["buy_count"] > 0]
-    zero_sell_pct = float((buy_matched["sell_count"] == 0).mean() * 100.0) if not buy_matched.empty else 0.0
+    zero_sell_pct = float((act_matched_all["sell_count"] == 0).mean() * 100.0) if not act_matched_all.empty else 0.0
     med_clip_usdc = float(buy_matched["avg_clip_usdc"].median()) if not buy_matched.empty else 0.0
 
     big_matched = buy_matched[buy_matched["true_cost"] >= 1000.0]
@@ -1092,16 +1183,26 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
 
     # --- Lưới 4: Dải xác suất & Rủi ro ---
     if priced_cost > 0:
-        core_band_pct = float(priced_df[(priced_df["avg_price"] >= 0.15) & (priced_df["avg_price"] <= 0.90)]["true_cost"].sum() / priced_cost * 100.0)
+        core_band_pct = float(
+            priced_df[(priced_df["avg_price"] >= 0.15) & (priced_df["avg_price"] <= 0.90)]["true_cost"].sum()
+            / priced_cost
+            * 100.0
+        )
         high_fav_pct = float(priced_df[priced_df["avg_price"] >= 0.95]["true_cost"].sum() / priced_cost * 100.0)
     else:
         core_band_pct = 100.0
         high_fav_pct = 0.0
 
-    mkt_pnls = pos_df.groupby(np.where(pos_df["condition_id"] != "", pos_df["condition_id"], pos_df["token_id"]))["total_pnl"].sum()
+    mkt_pnls = settled_df.groupby(
+        np.where(settled_df["condition_id"] != "", settled_df["condition_id"], settled_df["token_id"])
+    )["total_pnl"].sum()
     top5_sum = float(mkt_pnls[mkt_pnls > 0].sort_values(ascending=False).head(5).sum())
     pnl_ex_top5 = net_pnl - top5_sum
-    hedged_cap_pct = (float(pos_df.loc[pos_df["is_hedged"], "true_cost"].sum()) / total_cost * 100.0) if total_cost > 0 else 0.0
+    hedged_cap_pct = (
+        (float(settled_df.loc[settled_df["is_hedged"], "true_cost"].sum()) / total_cost * 100.0)
+        if total_cost > 0
+        else 0.0
+    )
 
     # ==========================================================================
     # ĐÁNH GIÁ 4 LƯỚI LỌC TINH GỌN
@@ -1179,7 +1280,7 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
         "s3_passed": passed,
         "passed_gates_cnt": passed_cnt,
         "gate_badge": "Dừng 3A" if stage3a_only else f"{passed_cnt}/4 Lưới",
-        "audit_pos_cnt": n_pos,
+        "audit_pos_cnt": n_settled,
         "true_cost_usdc": round(total_cost, 2),
         "ledger_pnl_usdc": round(net_pnl, 2),
         "true_roi_pct": round(true_roi, 2),
@@ -1193,7 +1294,7 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
         "med_clip_usdc": round(med_clip_usdc, 0),
         "zero_sell_pct": round(zero_sell_pct, 0),
         "hold_pnl_share_pct": round(hold_pnl_share, 1),
-        "act_match_info": "Dừng 3A" if stage3a_only else f"{len(act_matched_only)}/{n_pos}",
+        "act_match_info": "Dừng 3A" if stage3a_only else f"{len(act_matched_only)}/{n_settled}",
         "core_band_pct": round(core_band_pct, 1),
         "high_fav_pct": round(high_fav_pct, 1),
         "pnl_ex_top5": round(pnl_ex_top5, 2),
@@ -1251,7 +1352,10 @@ def step3_deep_ledger_audit(
         else:
             stage3b_candidates.append(w)
 
-    to_fetch_act = [w for w in stage3b_candidates if w not in activity_cache]
+    to_fetch_act = [
+        w for w in stage3b_candidates
+        if w not in activity_cache or not activity_cache[w]
+    ]
     done_3b = len(stage3b_candidates) - len(to_fetch_act)
 
     if to_fetch_act:
@@ -1260,7 +1364,8 @@ def step3_deep_ledger_audit(
             for fut in as_completed(fut_to_w):
                 w = fut_to_w[fut]
                 try:
-                    activity_cache[w] = fut.result()
+                    fetched_acts = fut.result()
+                    activity_cache[w] = fetched_acts if fetched_acts else (wallet_cache.get(w, {}).get("seed_acts") or [])
                 except Exception:
                     activity_cache[w] = wallet_cache.get(w, {}).get("seed_acts") or []
                 done_3b += 1
@@ -1363,7 +1468,7 @@ with st.sidebar:
         max_high_fav = st.slider("Trần vốn dải >=95¢ (%)", 0.0, 40.0, 15.0, 2.5)
         max_hedged_pct = st.slider("Trần % Vốn Hedge 2 đầu", 0.0, 30.0, 10.0, 2.0)
         require_ex_top5 = st.checkbox("Bắt buộc PnL ngoài Top 5 kèo > $0", value=True)
-        max_act_pages = st.slider("Trang Activity tối đa (×500)", 2, 12, 6, 1)
+        max_act_pages = st.slider("Trang Activity tối đa (×500)", 2, 20, 8, 1)
 
     if st.session_state["wallet_cache"]:
         st.divider()
