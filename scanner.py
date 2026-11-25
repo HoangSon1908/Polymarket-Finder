@@ -13,7 +13,7 @@ from requests.adapters import HTTPAdapter
 import streamlit as st
 
 st.set_page_config(
-    page_title="Polymarket Pro Wallet Finder — 4-Pillar Pipeline",
+    page_title="Polymarket Pro Wallet Finder — 4-Pillar Pipeline (v5.2)",
     page_icon="📡",
     layout="wide",
 )
@@ -64,7 +64,7 @@ def get_http_session() -> requests.Session:
         sess.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "Polymarket-Wallet-Finder/5.1-4Pillars",
+                "User-Agent": "Polymarket-Wallet-Finder/5.2-4Pillars",
             }
         )
         _THREAD_LOCAL.session = sess
@@ -766,7 +766,7 @@ def step2_surface_filter(
 
 
 # ==============================================================================
-# BƯỚC 3: KIỂM TOÁN 4 LƯỚI LỌC TINH GỌN (ĐỒNG BỘ TẬP KÈO ĐÃ NGÃ NGŨ)
+# BƯỚC 3: KIỂM TOÁN 4 LƯỚI LỌC TINH GỌN (SHARE-WEIGHTED TRUE EDGE)
 # ==============================================================================
 
 def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str, Any]]) -> pd.DataFrame:
@@ -920,7 +920,6 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
     ]:
         pos_df[col] = act_merged[col].fillna(def_v) if col in act_merged.columns else def_v
 
-    # Bổ sung avg_price từ Activity nếu API Positions trả avg_price = 0
     pos_df["avg_price"] = np.where(
         pos_df["avg_price"] > 0.001,
         pos_df["avg_price"],
@@ -958,7 +957,6 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
     )
     size_cost = raw_size_for_cost * pos_df["avg_price"]
 
-    # Giá trung bình suy diễn từ các vị thế đã biết giá để ước lượng vốn các lệnh thắng cổ xưa nếu API thiếu avg_price
     known_prices = pos_df.loc[(pos_df["avg_price"] > 0.05) & (pos_df["avg_price"] < 0.95), "avg_price"]
     median_known_p = float(known_prices.median()) if len(known_prices) >= 5 else 0.55
     median_known_p = max(0.25, min(0.80, median_known_p))
@@ -1052,7 +1050,7 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
 
 
 def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_only: bool = False) -> dict[str, Any]:
-    """Đánh giá ví qua 4 Lưới Lọc Tinh Gọn trên tập vị thế đã ngã ngũ (Chống lệch mẫu API & Overfit)."""
+    """Đánh giá ví qua 4 Lưới Lọc Tinh Gọn với Share-Weighted True Edge (chuẩn xác trên thị trường nhị phân)."""
     if pos_df.empty:
         return {
             "s3_verdict": "❌ KHÔNG DỮ LIỆU",
@@ -1081,7 +1079,6 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
             "s3_flags": "Không có dữ liệu vị thế hợp lệ",
         }
 
-    # Tách riêng tập vị thế ĐÃ NGÃ NGŨ (loại bỏ kèo OPEN đang chờ trận để không tính oan là thua)
     settled_df = pos_df[pos_df["status"] != "OPEN"].copy()
     if settled_df.empty:
         return {
@@ -1116,23 +1113,31 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
     net_pnl = float(settled_df["total_pnl"].sum())
     true_roi = (net_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
 
-    # Đồng bộ 100% tập mẫu tính CapWR với True ROI trên toàn bộ vị thế đã ngã ngũ
-    count_wr = float(settled_df["real_win"].mean() * 100.0)
-    cap_wr = (
-        float(settled_df.loc[settled_df["real_win"], "true_cost"].sum() / total_cost * 100.0)
-        if total_cost > 0
-        else 0.0
+    # Quy đổi về hợp đồng nhị phân $1/share (S_i = C_i / p_i):
+    # ShareWR - BreakEvenWR = Net PnL / Total Shares > 0 <=> Ví có lợi thế thực vượt giá thị trường.
+    known_p = settled_df.loc[(settled_df["avg_price"] > 0.005) & (settled_df["avg_price"] < 0.995), "avg_price"]
+    fallback_p = float(known_p.median()) if not known_p.empty else 0.50
+    eff_p = np.where(
+        (settled_df["avg_price"] > 0.005) & (settled_df["avg_price"] < 0.995),
+        settled_df["avg_price"],
+        fallback_p,
     )
 
-    # Giá mua TB & phân bổ dải xác suất tính trên các kèo đã ngã ngũ có giá xác thực (> 0.5¢)
+    payout_shares = np.where(
+        settled_df["real_win"],
+        np.maximum(settled_df["true_cost"] + settled_df["total_pnl"], settled_df["true_cost"] / eff_p),
+        settled_df["true_cost"] / eff_p,
+    )
+    tot_shares = float(payout_shares.sum())
+    win_shares = float(payout_shares[settled_df["real_win"]].sum())
+
+    count_wr = float(settled_df["real_win"].mean() * 100.0)
+    cap_wr = (win_shares / tot_shares * 100.0) if tot_shares > 0 else 0.0
+    w_entry = (total_cost / tot_shares * 100.0) if tot_shares > 0 else 50.0
+    cap_edge = cap_wr - w_entry
+
     priced_df = settled_df[settled_df["avg_price"] > 0.005]
     priced_cost = float(priced_df["true_cost"].sum())
-    w_entry = (
-        float((priced_df["avg_price"] * priced_df["true_cost"]).sum() / priced_cost * 100.0)
-        if priced_cost > 0
-        else 50.0
-    )
-    cap_edge = cap_wr - w_entry
 
     matched_settled = settled_df[settled_df["exit_style"].isin(["HOLD_TO_EXPIRY", "SOLD_EARLY", "PARTIAL_SELL"])]
     act_matched_only = settled_df[settled_df["has_act_match"]]
@@ -1236,12 +1241,12 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
     else:
         failed_gates.append("L2-Đáo hạn: " + (", ".join(g2_reasons) if g2_reasons else "chưa kéo Act"))
 
-    # Lưới 3: Lợi thế dự báo thực (True ROI & CapEdge)
+    # Lưới 3: Lợi thế dự báo thực (True ROI & Share-Weighted Edge)
     g3_reasons = []
     if true_roi < float(cfg["min_true_roi"]):
         g3_reasons.append(f"ROI {true_roi:+.1f}%<{cfg['min_true_roi']:.1f}%")
     if cap_edge < float(cfg["min_cap_edge"]):
-        g3_reasons.append(f"CapEdge {cap_edge:+.1f}%<{cfg['min_cap_edge']:.1f}%")
+        g3_reasons.append(f"TrueEdge {cap_edge:+.1f}%<{cfg['min_cap_edge']:.1f}%")
     if not g3_reasons:
         passed_cnt += 1
     else:
@@ -1408,20 +1413,20 @@ def step3_deep_ledger_audit(
 
 
 # ==============================================================================
-# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN FULL PIPELINE 4 LƯỚI LỌC TINH GỌN
+# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN FULL PIPELINE 4 LƯỚI LỌC TINH GỌN (v5.2)
 # ==============================================================================
 
-st.title("📡 Polymarket Pro Wallet Finder — 4-Pillar CS2 Pipeline")
+st.title("📡 Polymarket Pro Wallet Finder — 4-Pillar CS2 Pipeline (v5.2)")
 st.caption(
     "**Bước 1:** Kéo Leaderboard / Soi trực tiếp `0x...` → "
     "**Bước 2:** Lọc bề mặt & cache sổ vị thế → "
-    "**Bước 3:** Kiểm toán **4 Lưới Cốt Lõi** (Chống Trade Live • Diamond Hands • True Edge • Rủi Ro)."
+    "**Bước 3:** Kiểm toán **4 Lưới Cốt Lõi** (Chống Trade Live • Diamond Hands • Share-Weighted Edge • Rủi Ro)."
 )
 
 s1, s2, s3 = st.columns(3)
 s1.success("✅ **Bước 1: Thu thập Leaderboard**\n\nChia lô an toàn + Soi trực tiếp ví `0x...`")
 s2.success("✅ **Bước 2: Lọc & Cache Positions**\n\nVá chuẩn vốn các kèo thắng lịch sử")
-s3.success("✅ **Bước 3: 4 Lưới Lọc Tinh Gọn**\n\nChống Overfit • Giữ chuẩn DNA CS2")
+s3.success("✅ **Bước 3: 4 Lưới Lọc Tinh Gọn**\n\nShare-Weighted Edge • Giữ chuẩn DNA CS2")
 
 for key, default_val in [
     ("df_step1_raw", pd.DataFrame()),
@@ -1463,7 +1468,7 @@ with st.sidebar:
 
     with st.expander("📈 Lưới 3 & 4: True Edge & Rủi Ro", expanded=True):
         min_true_roi = st.slider("True ROI 1 chiều tối thiểu (%)", 0.0, 30.0, 4.0, 0.5)
-        min_cap_edge = st.slider("CapEdge tối thiểu (+%)", -2.0, 15.0, 1.0, 0.5)
+        min_cap_edge = st.slider("TrueEdge tối thiểu (+%)", -2.0, 15.0, 1.0, 0.5)
         min_core_band = st.slider("% Vốn dải lõi 15%–90%", 40.0, 95.0, 65.0, 5.0)
         max_high_fav = st.slider("Trần vốn dải >=95¢ (%)", 0.0, 40.0, 15.0, 2.5)
         max_hedged_pct = st.slider("Trần % Vốn Hedge 2 đầu", 0.0, 30.0, 10.0, 2.0)
@@ -1677,9 +1682,9 @@ if meta_res:
             "true_cost_usdc": st.column_config.NumberColumn("Vốn 1 chiều ($)", format="$%,.0f"),
             "ledger_pnl_usdc": st.column_config.NumberColumn("Net PnL sổ cái", format="$%+,.0f"),
             "true_roi_pct": st.column_config.NumberColumn("True ROI", format="%+.1f%%"),
-            "cap_wr_pct": st.column_config.NumberColumn("CapWR", format="%.1f%%"),
-            "w_entry_pct": st.column_config.NumberColumn("Giá mua TB", format="%.1f%%"),
-            "cap_edge_pct": st.column_config.NumberColumn("CapEdge", format="%+.1f%%"),
+            "cap_wr_pct": st.column_config.NumberColumn("ShareWR", format="%.1f%%"),
+            "w_entry_pct": st.column_config.NumberColumn("BreakEven WR", format="%.1f%%"),
+            "cap_edge_pct": st.column_config.NumberColumn("TrueEdge", format="%+.1f%%"),
             "core_band_pct": st.column_config.NumberColumn("% Vốn 15-90%", format="%.0f%%"),
             "hedged_cap_pct": st.column_config.NumberColumn("% Vốn Hedge", format="%.1f%%"),
             "pnl_ex_top5": st.column_config.NumberColumn("PnL ex-Top 5", format="$%+,.0f"),
