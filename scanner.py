@@ -13,7 +13,7 @@ from requests.adapters import HTTPAdapter
 import streamlit as st
 
 st.set_page_config(
-    page_title="Polymarket Pro Wallet Finder — Fast 3-Step Pipeline",
+    page_title="Polymarket Pro Wallet Finder — CS2 DNA 6-Gate Pipeline",
     page_icon="📡",
     layout="wide",
 )
@@ -64,7 +64,7 @@ def get_http_session() -> requests.Session:
         sess.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "Polymarket-Wallet-Finder/3.3",
+                "User-Agent": "Polymarket-Wallet-Finder/4.1-CS2-Calibrated",
             }
         )
         _THREAD_LOCAL.session = sess
@@ -243,7 +243,7 @@ def _fetch_positions_by_status(
     return rows, capped
 
 
-def _fetch_activities_v2(wallet: str, max_pages: int = 4) -> list[dict[str, Any]]:
+def _fetch_activities_v2(wallet: str, max_pages: int = 6) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     cursor: str | None = None
     for _ in range(max_pages):
@@ -506,8 +506,10 @@ def _probe_and_cache_positions(wallet: str, max_settled_cap: int, max_dead_cap: 
 
         if cur_p <= 0.01 and cur_v <= 0.5:
             dead_zero_open_cnt += 1
-        elif cur_v > 1.0 or (0.01 < cur_p < 0.99 and cur_s > 0):
+        elif 0.02 <= cur_p <= 0.98 and (cur_v > 1.0 or cur_s > 1.0):
             live_open_cnt += 1
+        elif cur_p > 0.98 and cur_v > 1.0:
+            pass
         else:
             dead_zero_open_cnt += 1
 
@@ -708,7 +710,7 @@ def step2_surface_filter(
 
 
 # ==============================================================================
-# BƯỚC 3: KIỂM TOÁN 2 CHẶNG (3A CPU TRÊN POSITIONS CACHE -> 3B ACTIVITY CHỌN LỌC)
+# BƯỚC 3: KIỂM TOÁN 6 LƯỚI LỌC CHUẨN CS2 DNA (HIỆU CHỈNH TỪ CS2.CSV)
 # ==============================================================================
 
 def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str, Any]]) -> pd.DataFrame:
@@ -740,6 +742,9 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
     pos_df["unrealized_pnl"] = pd.to_numeric(get_col(pos_df, ["unrealized_pnl", "unrealizedPnl"]), errors="coerce").fillna(0.0)
     pos_df["api_total_pnl"] = pd.to_numeric(get_col(pos_df, ["total_pnl", "totalPnl"]), errors="coerce")
 
+    pos_end_raw = get_col(pos_df, ["closed_at", "closedAt", "end_date", "endDate", "updated_at", "updatedAt"], None)
+    pos_df["pos_end_ts"] = pos_end_raw.apply(_to_unix_ts)
+
     slug_s = get_col(pos_df, ["event_slug", "eventSlug", "slug"], "")
     pos_df["url"] = slug_s.apply(lambda s: f"https://polymarket.com/event/{s}" if pd.notna(s) and str(s).strip() else "")
 
@@ -753,7 +758,6 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
         .reset_index(drop=True)
     )
 
-    # Quy đổi xác vị thế OPEN về 0¢ sang nhóm thua đã ngã ngũ (SETTLED_LOSS_0C)
     is_dead_0c = (pos_df["raw_status"] == "OPEN") & (pos_df["cur_price"] <= 0.01) & (pos_df["current_value"] <= 0.5)
     pos_df["status"] = np.where(is_dead_0c, "SETTLED_LOSS_0C", pos_df["raw_status"])
 
@@ -787,10 +791,26 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
 
             first_buy_ts = buys["ts"].min() if not buys.empty else grp["ts"].min()
             last_buy_ts = buys["ts"].max() if not buys.empty else grp["ts"].max()
+            redeem_ts = redeems["ts"].max() if not redeems.empty else np.nan
             last_ev_ts = grp["ts"].max()
 
-            accum_h = max(0.0, (last_buy_ts - first_buy_ts) / 3600.0) if pd.notna(first_buy_ts) and pd.notna(last_buy_ts) else 0.0
-            hold_h = max(0.0, (last_ev_ts - first_buy_ts) / 3600.0) if pd.notna(first_buy_ts) and pd.notna(last_ev_ts) else 0.0
+            accum_mins = (
+                max(0.0, (last_buy_ts - first_buy_ts) / 60.0)
+                if pd.notna(first_buy_ts) and pd.notna(last_buy_ts)
+                else 0.0
+            )
+            act_hold_hours = (
+                max(0.0, (last_ev_ts - first_buy_ts) / 3600.0)
+                if pd.notna(first_buy_ts) and pd.notna(last_ev_ts) and (last_ev_ts > first_buy_ts + 60)
+                else np.nan
+            )
+
+            valid_buy_prices = buys.loc[buys["price"] > 0, "price"]
+            buy_price_spread_c = (
+                float((valid_buy_prices.max() - valid_buy_prices.min()) * 100.0)
+                if len(valid_buy_prices) >= 2
+                else 0.0
+            )
 
             act_agg_by_tok[tid] = {
                 "has_act_match": True,
@@ -799,8 +819,10 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
                 "act_redeem_usdc": float(redeems["usdc"].sum()),
                 "buy_count": int(len(buys)),
                 "sell_count": int(len(sells)),
-                "accum_hours": accum_h,
-                "hold_hours": hold_h,
+                "accum_mins": accum_mins,
+                "accum_hours": accum_mins / 60.0,
+                "act_hold_hours": act_hold_hours,
+                "buy_price_spread_c": buy_price_spread_c,
                 "first_ts": first_buy_ts,
                 "last_ts": last_ev_ts,
             }
@@ -815,12 +837,22 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
         ("act_redeem_usdc", 0.0),
         ("buy_count", 0),
         ("sell_count", 0),
+        ("accum_mins", 0.0),
         ("accum_hours", 0.0),
-        ("hold_hours", 0.0),
+        ("act_hold_hours", np.nan),
+        ("buy_price_spread_c", 0.0),
         ("first_ts", np.nan),
         ("last_ts", np.nan),
     ]:
         pos_df[col] = act_merged[col].fillna(def_v) if col in act_merged.columns else def_v
+
+    # Vá lỗi kèo thua không có REDEEM: dùng pos_end_ts từ Positions làm mốc kết thúc dự phòng
+    fallback_hold_h = np.where(
+        pos_df["first_ts"].notna() & pos_df["pos_end_ts"].notna() & (pos_df["pos_end_ts"] > pos_df["first_ts"]),
+        (pos_df["pos_end_ts"] - pos_df["first_ts"]) / 3600.0,
+        np.nan,
+    )
+    pos_df["hold_hours"] = np.where(pos_df["act_hold_hours"].notna(), pos_df["act_hold_hours"], fallback_hold_h)
 
     calc_pnl = pos_df["realized_pnl"] + pos_df["unrealized_pnl"]
     pos_df["total_pnl"] = np.where(
@@ -829,7 +861,6 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
         calc_pnl,
     )
 
-    # 1. Vốn tường minh từ Activity hoặc API fields
     explicit_cost = np.where(
         pos_df["act_buy_usdc"] > 0,
         pos_df["act_buy_usdc"],
@@ -840,7 +871,6 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
         ),
     )
 
-    # 2. Vốn từ shares * avg_price (không dùng current_size cho lệnh đã CLOSED để tránh bụi shares)
     raw_size_for_cost = np.where(
         pos_df["total_size"] > 0,
         pos_df["total_size"],
@@ -848,7 +878,6 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
     )
     size_cost = raw_size_for_cost * pos_df["avg_price"]
 
-    # 3. Vốn suy ngược từ total_pnl và avg_price cho các vị thế lịch sử đã đóng (UNMATCHED_OLD)
     inferred_cost = np.where(
         (pos_df["total_pnl"] < 0) & (pos_df["status"] != "OPEN"),
         pos_df["total_pnl"].abs(),
@@ -862,7 +891,6 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
         ),
     )
 
-    # Loại bỏ size_cost dạng bụi trên các vị thế cũ đã đóng nếu lệch quá 50% so với vốn suy ngược
     valid_size_cost = np.where(
         (pos_df["status"] != "OPEN")
         & (inferred_cost > 0)
@@ -877,13 +905,11 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
         np.where(valid_size_cost > 0, valid_size_cost, inferred_cost),
     )
 
-    # Chốt chặn vật lý: Trên quyền chọn nhị phân không đòn bẩy, vốn gốc không bao giờ nhỏ hơn khoản lỗ
     pos_df["true_cost"] = np.maximum(
         pos_df["true_cost"],
         np.where(pos_df["total_pnl"] < 0, pos_df["total_pnl"].abs(), 0.0),
     )
 
-    # Đảm bảo xác vị thế 0¢ chưa claim luôn ghi nhận lỗ đầy đủ nếu API trả total_pnl = 0
     zero_pnl_dead = (pos_df["status"] == "SETTLED_LOSS_0C") & (pos_df["total_pnl"].abs() < 1e-6) & (pos_df["true_cost"] > 0)
     pos_df["total_pnl"] = np.where(zero_pnl_dead, -pos_df["true_cost"], pos_df["total_pnl"])
 
@@ -891,6 +917,11 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
     if pos_df.empty:
         return pos_df
 
+    pos_df["avg_clip_usdc"] = np.where(
+        pos_df["buy_count"] > 0,
+        np.where(pos_df["act_buy_usdc"] > 0, pos_df["act_buy_usdc"], pos_df["true_cost"]) / pos_df["buy_count"],
+        pos_df["true_cost"],
+    )
     pos_df["roi_pct"] = pos_df["total_pnl"] / pos_df["true_cost"] * 100.0
     pos_df["real_win"] = pos_df["total_pnl"] > 0
 
@@ -918,30 +949,40 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
     return pos_df
 
 
-def _score_ledger_df(pos_df: pd.DataFrame, cfg: dict[str, Any], skipped_activity: bool = False) -> dict[str, Any]:
+def _evaluate_ledger_gates(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_only: bool = False) -> dict[str, Any]:
+    """Đánh giá ví qua 6 Lưới Lọc Cứng hiệu chỉnh chuẩn từ dữ liệu CS2.csv (Stiff-Desktop)."""
     if pos_df.empty:
         return {
             "s3_verdict": "❌ KHÔNG DỮ LIỆU",
             "s3_passed": False,
-            "copy_score": 0,
+            "passed_gates_cnt": 0,
+            "gate_badge": "0/6 Lưới",
             "audit_pos_cnt": 0,
             "true_cost_usdc": 0.0,
             "ledger_pnl_usdc": 0.0,
             "true_roi_pct": 0.0,
+            "recent_45d_roi_pct": 0.0,
             "count_wr_pct": 0.0,
             "cap_wr_pct": 0.0,
+            "conviction_lift_pct": 0.0,
             "w_entry_pct": 0.0,
             "cap_edge_pct": 0.0,
             "z_score": 0.0,
+            "med_hold_h": 0.0,
+            "live_cap_pct": 0.0,
+            "big_single_shot_pct": 0.0,
+            "med_clip_usdc": 0.0,
+            "med_buy_spread_c": 0.0,
+            "zero_sell_pct": 0.0,
             "hold_pnl_share_pct": 0.0,
             "act_match_info": "0/0",
             "core_band_pct": 0.0,
             "high_fav_pct": 0.0,
             "penny_pct": 0.0,
             "pnl_ex_top5": 0.0,
+            "max_bet_share_pct": 0.0,
             "top20_roi_pct": 0.0,
             "med_buys": 0.0,
-            "gradual_pct": 0.0,
             "hedged_pct": 0.0,
             "open_live_unreal": 0.0,
             "s3_flags": "Không có dữ liệu vị thế hợp lệ",
@@ -954,6 +995,7 @@ def _score_ledger_df(pos_df: pd.DataFrame, cfg: dict[str, Any], skipped_activity
 
     count_wr = float(pos_df["real_win"].mean() * 100.0)
     cap_wr = float(pos_df.loc[pos_df["real_win"], "true_cost"].sum() / total_cost * 100.0) if total_cost > 0 else 0.0
+    conviction_lift = cap_wr - count_wr
     w_entry = float((pos_df["avg_price"] * pos_df["true_cost"]).sum() / total_cost * 100.0) if total_cost > 0 else 0.0
     cap_edge = cap_wr - w_entry
 
@@ -987,14 +1029,37 @@ def _score_ledger_df(pos_df: pd.DataFrame, cfg: dict[str, Any], skipped_activity
         tot_pos = pos_hold + pos_early
         hold_pnl_share = (pos_hold / tot_pos * 100.0) if tot_pos > 0 else 0.0
 
+    # --- DNA 1 & 2 & 3: Zero-Sell Diamond Hands, Hold Time & TWAP Execution ---
     buy_matched = pos_df[pos_df["buy_count"] > 0]
+    zero_sell_pct = float((buy_matched["sell_count"] == 0).mean() * 100.0) if not buy_matched.empty else 0.0
     med_buys = float(buy_matched["buy_count"].median()) if not buy_matched.empty else 0.0
-    gradual_pct = (
-        float(((buy_matched["buy_count"] > 3) & (buy_matched["accum_hours"] > 0.033)).mean() * 100.0)
-        if not buy_matched.empty
-        else 0.0
-    )
+    med_clip_usdc = float(buy_matched["avg_clip_usdc"].median()) if not buy_matched.empty else 0.0
 
+    big_matched = buy_matched[buy_matched["true_cost"] >= 1000.0]
+    if not big_matched.empty:
+        big_single_shot_pct = float((big_matched["buy_count"] == 1).mean() * 100.0)
+    elif not buy_matched.empty:
+        big_single_shot_pct = float((buy_matched["buy_count"] == 1).mean() * 100.0)
+    else:
+        big_single_shot_pct = 100.0
+
+    multi_buy = buy_matched[buy_matched["buy_count"] >= 2]
+    med_buy_spread_c = float(multi_buy["buy_price_spread_c"].median()) if not multi_buy.empty else 0.0
+
+    valid_holds = pos_df[pos_df["hold_hours"].notna()].copy()
+    if not valid_holds.empty:
+        med_hold_h = float(valid_holds["hold_hours"].median())
+        vh_cost = float(valid_holds["true_cost"].sum())
+        live_cap_pct = (
+            float(valid_holds.loc[valid_holds["hold_hours"] < 1.5, "true_cost"].sum() / vh_cost * 100.0)
+            if vh_cost > 0
+            else 0.0
+        )
+    else:
+        med_hold_h = 0.0
+        live_cap_pct = 0.0
+
+    # --- Dải xác suất ---
     core_band_cost = float(pos_df[(pos_df["avg_price"] >= 0.20) & (pos_df["avg_price"] <= 0.85)]["true_cost"].sum())
     high_fav_cost = float(pos_df[pos_df["avg_price"] >= 0.95]["true_cost"].sum())
     penny_cost = float(pos_df[pos_df["avg_price"] < 0.10]["true_cost"].sum())
@@ -1003,10 +1068,12 @@ def _score_ledger_df(pos_df: pd.DataFrame, cfg: dict[str, Any], skipped_activity
     high_fav_pct = (high_fav_cost / total_cost * 100.0) if total_cost > 0 else 0.0
     penny_pct = (penny_cost / total_cost * 100.0) if total_cost > 0 else 0.0
 
+    # --- Đi tiền & 1 chiều ---
     mkt_pnls = pos_df.groupby(np.where(pos_df["condition_id"] != "", pos_df["condition_id"], pos_df["token_id"]))["total_pnl"].sum()
     top5_sum = float(mkt_pnls[mkt_pnls > 0].sort_values(ascending=False).head(5).sum())
     pnl_ex_top5 = net_pnl - top5_sum
 
+    max_bet_share_pct = (float(pos_df["true_cost"].max()) / total_cost * 100.0) if total_cost > 0 else 0.0
     q80 = pos_df["true_cost"].quantile(0.80)
     q50 = pos_df["true_cost"].quantile(0.50)
     top20_df = pos_df[pos_df["true_cost"] >= q80]
@@ -1015,105 +1082,152 @@ def _score_ledger_df(pos_df: pd.DataFrame, cfg: dict[str, Any], skipped_activity
     bot50_roi = (float(bot50_df["total_pnl"].sum()) / float(bot50_df["true_cost"].sum()) * 100.0) if float(bot50_df["true_cost"].sum()) > 0 else 0.0
     hedged_pct = float(pos_df["is_hedged"].mean() * 100.0)
 
-    flags: list[str] = []
-    score = 0
+    # --- Phong độ 45 ngày gần nhất (Collapse Guard) ---
+    cutoff_45d = (datetime.now(timezone.utc) - timedelta(days=45)).timestamp()
+    recent_df = act_matched_only[act_matched_only["first_ts"] >= cutoff_45d]
+    recent_45d_cnt = len(recent_df)
+    recent_45d_cost = float(recent_df["true_cost"].sum())
+    recent_45d_roi = (float(recent_df["total_pnl"].sum()) / recent_45d_cost * 100.0) if recent_45d_cost > 0 else 0.0
+    recent_45d_wr = float(recent_df["real_win"].mean() * 100.0) if recent_45d_cnt > 0 else 100.0
 
-    if true_roi >= float(cfg["min_true_roi"]):
-        score += 20
+    # ==========================================================================
+    # ĐÁNH GIÁ 6 LƯỚI LỌC ĐỘC LẬP (CS2-CALIBRATED 6-GATE SIEVE)
+    # ==========================================================================
+    failed_gates: list[str] = []
+    passed_cnt = 0
+
+    # Lưới 1: Nhịp vào lệnh Pre-match & TWAP Execution (Chống Trade Live Dota)
+    g1_reasons = []
+    if len(act_matched_only) < int(cfg["min_act_matched"]):
+        g1_reasons.append(f"ít mẫu khớp Act ({len(act_matched_only)}<{cfg['min_act_matched']})")
+    if len(valid_holds) >= 5 and med_hold_h < float(cfg["min_hold_hours"]):
+        g1_reasons.append(f"nghi Trade Live (Hold TB {med_hold_h:.1f}h<{cfg['min_hold_hours']:.1f}h)")
+    if len(valid_holds) >= 5 and live_cap_pct > float(cfg["max_live_cap_pct"]):
+        g1_reasons.append(f"vốn đánh Live cao ({live_cap_pct:.1f}%>{cfg['max_live_cap_pct']:.1f}%)")
+    if big_single_shot_pct > float(cfg["max_big_single_shot_pct"]):
+        g1_reasons.append(f"kèo lớn bắn 1 cục ({big_single_shot_pct:.0f}%>{cfg['max_big_single_shot_pct']:.0f}%)")
+    if med_buy_spread_c > float(cfg["max_buy_spread_c"]):
+        g1_reasons.append(f"giá mua nhảy loạn ({med_buy_spread_c:.1f}¢>{cfg['max_buy_spread_c']:.0f}¢)")
+    if not g1_reasons and not stage3a_only:
+        passed_cnt += 1
     else:
-        flags.append(f"True ROI {true_roi:+.1f}% < {cfg['min_true_roi']:.1f}%")
+        failed_gates.append("L1-Timing: " + (", ".join(g1_reasons) if g1_reasons else "chưa kéo Act"))
 
+    # Lưới 2: Pure Diamond Hands & Đáo Hạn (Zero-Sell + Redeem)
+    g2_reasons = []
+    if zero_sell_pct < float(cfg["min_zero_sell_pct"]):
+        g2_reasons.append(f"hay bán giữa trận (ZeroSell={zero_sell_pct:.0f}%<{cfg['min_zero_sell_pct']:.0f}%)")
+    if hold_pnl_share < float(cfg["min_hold_redeem"]):
+        g2_reasons.append(f"lãi bán non (Hold={hold_pnl_share:.0f}%<{cfg['min_hold_redeem']:.0f}%, Early=${early_pnl:+,.0f})")
+    if not g2_reasons and not stage3a_only:
+        passed_cnt += 1
+    else:
+        failed_gates.append("L2-Diamond: " + (", ".join(g2_reasons) if g2_reasons else "chưa kéo Act"))
+
+    # Lưới 3: Năng lực dự báo thực sự (True ROI, CapEdge, Z-score)
+    g3_reasons = []
+    if true_roi < float(cfg["min_true_roi"]):
+        g3_reasons.append(f"ROI {true_roi:+.1f}%<{cfg['min_true_roi']:.1f}%")
+    if cap_edge < float(cfg["min_cap_edge"]):
+        g3_reasons.append(f"Edge {cap_edge:+.1f}%<{cfg['min_cap_edge']:.1f}%")
+    if z_score < float(cfg["min_z_score"]):
+        g3_reasons.append(f"Z={z_score:.2f}<{cfg['min_z_score']:.2f}")
     if open_live_unreal < -0.25 * max(abs(net_pnl), 2000.0):
-        flags.append(f"Đang gồng lỗ OPEN (${open_live_unreal:+,.0f})")
-
-    if cap_edge >= float(cfg["min_cap_edge"]) and z_score >= float(cfg["min_z_score"]):
-        score += 25
-    elif cap_edge >= float(cfg["min_cap_edge"]) * 0.65 and z_score >= 1.28:
-        score += 12
-        flags.append(f"Edge/Z trung bình (Edge {cap_edge:+.1f}%, Z={z_score:.2f})")
+        g3_reasons.append(f"gồng lỗ OPEN ${open_live_unreal:+,.0f}")
+    if not g3_reasons:
+        passed_cnt += 1
     else:
-        flags.append(f"Thiếu Edge (CapEdge {cap_edge:+.1f}%, Z={z_score:.2f})")
+        failed_gates.append("L3-Edge: " + ", ".join(g3_reasons))
 
-    if skipped_activity:
-        flags.append("Dừng sớm Chặng 3A (không kéo Activity)")
-    elif hold_pnl_share >= float(cfg["min_hold_redeem"]):
-        score += 20
+    # Lưới 4: Kỷ luật dải xác suất
+    g4_reasons = []
+    if core_band_pct < float(cfg["min_core_band"]):
+        g4_reasons.append(f"dải 20-85% thấp ({core_band_pct:.0f}%<{cfg['min_core_band']:.0f}%)")
+    if high_fav_pct > float(cfg["max_high_fav"]):
+        g4_reasons.append(f"bẫy Fav >=95¢ ({high_fav_pct:.1f}%>{cfg['max_high_fav']:.0f}%)")
+    if penny_pct > float(cfg["max_penny_pct"]):
+        g4_reasons.append(f"vé số <10¢ ({penny_pct:.1f}%>{cfg['max_penny_pct']:.0f}%)")
+    if not g4_reasons:
+        passed_cnt += 1
     else:
-        flags.append(f"Lãi bán non (Hold={hold_pnl_share:.0f}% < {cfg['min_hold_redeem']:.0f}%, Early=${early_pnl:+,.0f})")
+        failed_gates.append("L4-Odds: " + ", ".join(g4_reasons))
 
-    if core_band_pct >= float(cfg["min_core_band"]) and high_fav_pct <= float(cfg["max_high_fav"]) and penny_pct <= 20.0:
-        score += 15
+    # Lưới 5: Conviction Sizing & 1 chiều
+    g5_reasons = []
+    if hedged_pct > float(cfg["max_hedged_pct"]):
+        g5_reasons.append(f"hedge 2 đầu ({hedged_pct:.1f}%>{cfg['max_hedged_pct']:.0f}%)")
+    if max_bet_share_pct > float(cfg["max_single_bet_pct"]):
+        g5_reasons.append(f"1 kèo chiếm {max_bet_share_pct:.1f}%>{cfg['max_single_bet_pct']:.0f}% vốn")
+    if conviction_lift < float(cfg["min_conviction_lift"]) or (top20_roi < bot50_roi - 2.0):
+        g5_reasons.append(f"nhồi tiền kém (Lift {conviction_lift:+.1f}%, Top20 ROI {top20_roi:+.1f}%)")
+    if not g5_reasons:
+        passed_cnt += 1
     else:
-        if high_fav_pct > float(cfg["max_high_fav"]):
-            flags.append(f"Bẫy Fav >=95¢ ({high_fav_pct:.1f}%)")
-        if penny_pct > 20.0:
-            flags.append(f"Vé số <10¢ ({penny_pct:.1f}%)")
-        if core_band_pct < float(cfg["min_core_band"]):
-            flags.append(f"Vốn 20-85% thấp ({core_band_pct:.1f}%)")
+        failed_gates.append("L5-Sizing: " + ", ".join(g5_reasons))
 
-    if pnl_ex_top5 > 0:
-        score += 8
-    elif bool(cfg["require_ex_top5"]):
-        flags.append(f"Phụ thuộc Top 5 (ex-Top 5=${pnl_ex_top5:+,.0f})")
-
-    if (cap_wr + 1.5 >= count_wr) and (top20_roi >= bot50_roi - 2.0):
-        score += 7
+    # Lưới 6: Bền vững & Chống sập phong độ gần đây (Collapse Guard)
+    g6_reasons = []
+    if bool(cfg["require_ex_top5"]) and pnl_ex_top5 <= 0:
+        g6_reasons.append(f"ex-Top5=${pnl_ex_top5:+,.0f}<=0")
+    if (
+        not stage3a_only
+        and recent_45d_cnt >= 10
+        and recent_45d_roi < float(cfg["min_recent_roi"])
+        and recent_45d_wr < 45.0
+    ):
+        g6_reasons.append(f"sập phong độ 45d (ROI {recent_45d_roi:+.1f}%, WR {recent_45d_wr:.0f}%)")
+    if not g6_reasons:
+        passed_cnt += 1
     else:
-        flags.append(f"Nhồi tiền kém (CapWR {cap_wr:.1f}% vs WR {count_wr:.1f}%)")
+        failed_gates.append("L6-Phong độ: " + ", ".join(g6_reasons))
 
-    if not skipped_activity:
-        if gradual_pct >= 30.0 or med_buys >= 4.0:
-            score += 5
-        else:
-            flags.append(f"Gom nhanh (MedBuys={med_buys:.1f}, Gradual={gradual_pct:.0f}%)")
-
-    if hedged_pct > 20.0:
-        flags.append(f"Hedge 2 đầu cao ({hedged_pct:.1f}%)")
-
-    critical_fail = (
-        skipped_activity
-        or true_roi < float(cfg["min_true_roi"])
-        or cap_edge < float(cfg["min_cap_edge"]) * 0.65
-        or hold_pnl_share < float(cfg["min_hold_redeem"])
-        or high_fav_pct > float(cfg["max_high_fav"])
-        or (bool(cfg["require_ex_top5"]) and pnl_ex_top5 <= 0)
-    )
-
-    if score >= 80 and not critical_fail:
+    if stage3a_only:
+        verdict = "❌ LOẠI (3A Sớm)"
+        passed = False
+    elif passed_cnt == 6:
         verdict = "🏆 CHUẨN PRO COPY"
         passed = True
-    elif score >= 60 and not skipped_activity:
-        verdict = "🟡 THEO DÕI THÊM"
+    elif passed_cnt == 5:
+        verdict = "🟡 SÁT CHUẨN (5/6)"
         passed = False
     else:
-        verdict = "❌ LOẠI (3A Sớm)" if skipped_activity else "❌ LOẠI (Sổ cái)"
+        verdict = f"❌ LOẠI ({passed_cnt}/6 Lưới)"
         passed = False
 
     return {
         "s3_verdict": verdict,
         "s3_passed": passed,
-        "copy_score": score,
+        "passed_gates_cnt": passed_cnt,
+        "gate_badge": "Dừng 3A" if stage3a_only else f"{passed_cnt}/6 Lưới",
         "audit_pos_cnt": n_pos,
         "true_cost_usdc": round(total_cost, 2),
         "ledger_pnl_usdc": round(net_pnl, 2),
         "true_roi_pct": round(true_roi, 2),
+        "recent_45d_roi_pct": round(recent_45d_roi, 1),
         "count_wr_pct": round(count_wr, 1),
         "cap_wr_pct": round(cap_wr, 1),
+        "conviction_lift_pct": round(conviction_lift, 1),
         "w_entry_pct": round(w_entry, 1),
         "cap_edge_pct": round(cap_edge, 2),
         "z_score": round(z_score, 2),
+        "med_hold_h": round(med_hold_h, 1),
+        "live_cap_pct": round(live_cap_pct, 2),
+        "big_single_shot_pct": round(big_single_shot_pct, 0),
+        "med_clip_usdc": round(med_clip_usdc, 0),
+        "med_buy_spread_c": round(med_buy_spread_c, 1),
+        "zero_sell_pct": round(zero_sell_pct, 0),
         "hold_pnl_share_pct": round(hold_pnl_share, 1),
-        "act_match_info": "Dừng 3A" if skipped_activity else f"{len(act_matched_only)}/{n_pos}",
+        "act_match_info": "Dừng 3A" if stage3a_only else f"{len(act_matched_only)}/{n_pos}",
         "core_band_pct": round(core_band_pct, 1),
         "high_fav_pct": round(high_fav_pct, 1),
         "penny_pct": round(penny_pct, 1),
         "pnl_ex_top5": round(pnl_ex_top5, 2),
+        "max_bet_share_pct": round(max_bet_share_pct, 1),
         "top20_roi_pct": round(top20_roi, 1),
         "med_buys": round(med_buys, 1),
-        "gradual_pct": round(gradual_pct, 0),
         "hedged_pct": round(hedged_pct, 1),
         "open_live_unreal": round(open_live_unreal, 2),
-        "s3_flags": " | ".join(flags) if flags else "Sạch lỗi — Đạt toàn bộ DNA ví CS2",
+        "s3_flags": " | ".join(failed_gates) if failed_gates else "✅ Đạt trọn vẹn 6/6 Lưới DNA ví CS2",
     }
 
 
@@ -1141,24 +1255,26 @@ def step3_deep_ledger_audit(
     details_map: dict[str, pd.DataFrame] = {}
     stage3b_candidates: list[str] = []
 
+    # Chặng 3A: Chặn sớm bằng Positions Cache (0ms mạng) trước khi kéo Activity
     for w in wallets:
         cached = wallet_cache.get(w, {})
         raw_pos = cached.get("raw_positions") or []
         seed_acts = cached.get("seed_acts") or []
 
         pre_df = _build_ledger_from_raw(raw_pos, seed_acts)
-        pre_score = _score_ledger_df(pre_df, cfg, skipped_activity=True)
+        pre_eval = _evaluate_ledger_gates(pre_df, cfg, stage3a_only=True)
 
         fail_hard_3a = (
             pre_df.empty
-            or pre_score["high_fav_pct"] > float(cfg["max_high_fav"]) + 5.0
-            or pre_score["core_band_pct"] < float(cfg["min_core_band"]) - 15.0
-            or pre_score["true_roi_pct"] < float(cfg["min_true_roi"]) * 0.4
-            or (bool(cfg["require_ex_top5"]) and pre_score["pnl_ex_top5"] <= 0)
+            or pre_eval["high_fav_pct"] > float(cfg["max_high_fav"]) + 5.0
+            or pre_eval["core_band_pct"] < float(cfg["min_core_band"]) - 15.0
+            or pre_eval["true_roi_pct"] < float(cfg["min_true_roi"]) * 0.4
+            or pre_eval["hedged_pct"] > float(cfg["max_hedged_pct"]) + 10.0
+            or (bool(cfg["require_ex_top5"]) and pre_eval["pnl_ex_top5"] <= 0)
         )
 
         if fail_hard_3a:
-            audit_map[w] = pre_score
+            audit_map[w] = pre_eval
             if not pre_df.empty:
                 details_map[w] = pre_df
         else:
@@ -1184,7 +1300,7 @@ def step3_deep_ledger_audit(
         raw_pos = wallet_cache.get(w, {}).get("raw_positions") or []
         full_acts = activity_cache.get(w) or wallet_cache.get(w, {}).get("seed_acts") or []
         full_df = _build_ledger_from_raw(raw_pos, full_acts)
-        audit_map[w] = _score_ledger_df(full_df, cfg, skipped_activity=False)
+        audit_map[w] = _evaluate_ledger_gates(full_df, cfg, stage3a_only=False)
         if not full_df.empty:
             details_map[w] = full_df
 
@@ -1193,12 +1309,12 @@ def step3_deep_ledger_audit(
         work_df[c] = [audit_map[str(w).strip().lower()][c] for w in work_df["wallet"]]
 
     work_df = work_df.sort_values(
-        by=["s3_passed", "copy_score", "cap_edge_pct", "true_roi_pct"],
+        by=["s3_passed", "passed_gates_cnt", "cap_edge_pct", "true_roi_pct"],
         ascending=[False, False, False, False],
     ).reset_index(drop=True)
 
     df_final = work_df[work_df["s3_passed"]].reset_index(drop=True)
-    watch_cnt = int((work_df["s3_verdict"] == "🟡 THEO DÕI THÊM").sum())
+    watch_cnt = int((work_df["passed_gates_cnt"] == 5).sum())
     elapsed = round(time.perf_counter() - t0, 2)
 
     return (
@@ -1216,20 +1332,20 @@ def step3_deep_ledger_audit(
 
 
 # ==============================================================================
-# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN FULL PIPELINE 3 BƯỚC TỐI ƯU
+# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN FULL PIPELINE 6 LƯỚI LỌC CHUẨN CS2
 # ==============================================================================
 
-st.title("📡 Polymarket Pro Wallet Finder — Fast 3-Step Pipeline")
+st.title("📡 Polymarket Pro Wallet Finder — CS2 DNA 6-Gate Pipeline")
 st.caption(
     "**Bước 1:** Kéo Leaderboard theo lô an toàn → "
     "**Bước 2:** Lọc bề mặt & cache sổ vị thế → "
-    "**Bước 3:** Chặn sớm Chặng 3A (0ms mạng) & chỉ kéo Activity cho ứng viên sáng giá."
+    "**Bước 3:** Kiểm toán **6 Lưới Lọc Cứng** hiệu chỉnh từ DNA thực chiến `CS2.csv` (`Stiff-Desktop`)."
 )
 
 s1, s2, s3 = st.columns(3)
 s1.success("✅ **Bước 1: Thu thập Leaderboard**\n\nChia lô an toàn 20/trang + Log lỗi rõ")
-s2.success("✅ **Bước 2: Lọc & Cache Positions**\n\nKhông tải trùng lặp sang Bước 3")
-s3.success("✅ **Bước 3: Sổ cái 2 Chặng + X-Ray**\n\nĐã vá chuẩn vốn UNMATCHED_OLD")
+s2.success("✅ **Bước 2: Lọc & Cache Positions**\n\nTách chuẩn kèo LIVE vs chưa Claim")
+s3.success("✅ **Bước 3: 6 Lưới Lọc Chuẩn CS2**\n\nZero-Sell • TWAP Gom Lệnh • Pre-match")
 
 for key, default_val in [
     ("df_step1_raw", pd.DataFrame()),
@@ -1245,7 +1361,7 @@ for key, default_val in [
         st.session_state[key] = default_val
 
 with st.sidebar:
-    st.header("⚙️ Ngưỡng Lọc Bước 2 (Bề mặt)")
+    st.header("⚙️ Bước 2: Lưới Lọc Bề Mặt")
     min_pv_pct = st.slider("1. Sàn PnL / UI Volume (%)", 0.0, 15.0, 4.0, 0.5)
     min_net_pnl = st.number_input("2. Net PnL tối thiểu ($)", min_value=0.0, value=5000.0, step=1000.0)
 
@@ -1255,18 +1371,35 @@ with st.sidebar:
 
     max_dead_open = st.number_input("5. Trần xác vị thế 0¢ tối đa", min_value=0, max_value=5000, value=1000, step=100)
     max_inactive_days = st.slider("6. Ngừng chạy tối đa (ngày)", 1, 90, 30, 1)
-    allow_live_open_override = st.checkbox("Giữ ví nếu đang có lệnh OPEN sống (> $1)", value=True)
+    allow_live_open_override = st.checkbox("Giữ ví nếu đang có kèo chưa ngã ngũ (> $1)", value=True)
 
     st.divider()
-    st.header("🔬 Ngưỡng Bước 3 (Sổ cái sâu)")
-    min_true_roi = st.slider("7. True ROI 1 chiều tối thiểu (%)", 0.0, 30.0, 8.0, 1.0)
-    min_cap_edge = st.slider("8. CapEdge tối thiểu (+%)", 0.0, 15.0, 4.0, 0.5)
-    min_z_score = st.slider("9. Z-score thống kê tối thiểu", 0.0, 3.0, 1.65, 0.15)
-    min_hold_redeem = st.slider("10. % Lãi giữ đáo hạn REDEEM", 50.0, 100.0, 80.0, 5.0)
-    min_core_band = st.slider("11. % Vốn dải 20%–85%", 40.0, 95.0, 70.0, 5.0)
-    max_high_fav = st.slider("12. Trần vốn dải >=95¢ (%)", 0.0, 30.0, 10.0, 2.0)
-    require_ex_top5 = st.checkbox("13. Bắt buộc PnL ex-Top 5 > $0", value=True)
-    max_act_pages = st.slider("Trang Activity tối đa (×500)", 2, 10, 4, 1)
+    st.header("🔬 Bước 3: 6 Lưới Lọc Sổ Cái (CS2 DNA)")
+
+    with st.expander("⏱️ Lưới 1 & 2: Chống Live, TWAP & Zero-Sell", expanded=True):
+        min_hold_hours = st.slider("Hold trung vị tối thiểu (giờ)", 0.5, 24.0, 4.0, 0.5, help="CS2.csv đạt 10.9h. Dota Trade Live thường < 1.5h.")
+        max_live_cap_pct = st.slider("Trần % vốn giữ < 1.5h (nghi Live)", 0.0, 20.0, 2.0, 0.5, help="CS2.csv chỉ có 0.01% vốn nằm dưới 1.5h.")
+        max_big_single_shot_pct = st.slider("Trần % kèo lớn (>=1k$) bắn 1 cục", 0.0, 100.0, 25.0, 5.0, help="CS2.csv rải trung bình 18 lệnh/kèo lớn, bắn 1 cục chỉ 3.1%.")
+        max_buy_spread_c = st.slider("Biên giá mua tối đa trong 1 kèo (¢)", 2.0, 25.0, 8.0, 1.0)
+        min_zero_sell_pct = st.slider("% Kèo giữ tuyệt đối không bán non", 50.0, 100.0, 90.0, 5.0, help="CS2.csv đạt 100.0% (953/953 kèo sell_count == 0).")
+        min_hold_redeem = st.slider("% Lãi giữ đáo hạn REDEEM", 50.0, 100.0, 80.0, 5.0)
+        min_act_matched = st.number_input("Số kèo khớp Activity tối thiểu", min_value=5, max_value=100, value=15, step=5)
+
+    with st.expander("📈 Lưới 3 & 4: Edge & Dải Xác Suất", expanded=True):
+        min_true_roi = st.slider("True ROI 1 chiều tối thiểu (%)", 0.0, 30.0, 7.5, 0.5, help="CS2.csv đạt +8.48%.")
+        min_cap_edge = st.slider("CapEdge tối thiểu (+%)", 0.0, 15.0, 2.5, 0.5, help="CS2.csv đạt +3.02% ở dải 30-75%.")
+        min_z_score = st.slider("Z-score thống kê tối thiểu", 0.0, 3.0, 0.85, 0.05, help="CS2.csv đạt 0.90 do phân bổ vốn Pareto.")
+        min_core_band = st.slider("% Vốn dải lõi 20%–85%", 40.0, 95.0, 75.0, 5.0, help="CS2.csv đạt 94.9%.")
+        max_high_fav = st.slider("Trần vốn dải >=95¢ (%)", 0.0, 30.0, 10.0, 2.0, help="CS2.csv chỉ 0.98%.")
+        max_penny_pct = st.slider("Trần vốn vé số <10¢ (%)", 0.0, 30.0, 15.0, 2.0, help="CS2.csv là 0.00%.")
+
+    with st.expander("🛡️ Lưới 5 & 6: Đi Tiền & Chống Sập Phong Độ", expanded=True):
+        max_hedged_pct = st.slider("Trần Hedge 2 đầu (%)", 0.0, 30.0, 10.0, 2.0, help="CS2.csv là 4.20%.")
+        max_single_bet_pct = st.slider("Trần 1 kèo lớn nhất / tổng vốn (%)", 2.0, 30.0, 10.0, 1.0, help="CS2.csv max chỉ 1.41%.")
+        min_conviction_lift = st.slider("Conviction Lift tối thiểu (CapWR - WR %)", -2.0, 10.0, 1.5, 0.5, help="CS2.csv đạt +4.20%.")
+        require_ex_top5 = st.checkbox("Bắt buộc PnL ngoài Top 5 kèo > $0", value=True)
+        min_recent_roi = st.slider("Ngưỡng sập ROI 45d gần nhất (%)", -30.0, 10.0, -15.0, 2.5, help="CS2.csv tháng 11 variance -2.7% vẫn an toàn.")
+        max_act_pages = st.slider("Trang Activity tối đa (×500)", 2, 12, 6, 1)
 
     if st.session_state["wallet_cache"]:
         st.divider()
@@ -1287,13 +1420,24 @@ step2_cfg = {
 }
 
 step3_cfg = {
+    "min_hold_hours": min_hold_hours,
+    "max_live_cap_pct": max_live_cap_pct,
+    "max_big_single_shot_pct": max_big_single_shot_pct,
+    "max_buy_spread_c": max_buy_spread_c,
+    "min_zero_sell_pct": min_zero_sell_pct,
+    "min_hold_redeem": min_hold_redeem,
+    "min_act_matched": min_act_matched,
     "min_true_roi": min_true_roi,
     "min_cap_edge": min_cap_edge,
     "min_z_score": min_z_score,
-    "min_hold_redeem": min_hold_redeem,
     "min_core_band": min_core_band,
     "max_high_fav": max_high_fav,
+    "max_penny_pct": max_penny_pct,
+    "max_hedged_pct": max_hedged_pct,
+    "max_single_bet_pct": max_single_bet_pct,
+    "min_conviction_lift": min_conviction_lift,
     "require_ex_top5": require_ex_top5,
+    "min_recent_roi": min_recent_roi,
     "max_act_pages": max_act_pages,
 }
 
@@ -1332,11 +1476,11 @@ def _execute_steps_2_3(df_s1: pd.DataFrame, meta: dict[str, Any]) -> None:
         df_s1, cfg=step2_cfg, wallet_cache=st.session_state["wallet_cache"], progress_cb=cb_s2
     )
 
-    pbar.progress(0.65, text=f"🔬 Bước 3A: Đang chấm điểm nhanh {len(df_s2_passed)} ví trên Positions cache...")
+    pbar.progress(0.65, text=f"🔬 Bước 3A: Đang sàng lọc nhanh {len(df_s2_passed)} ví trên Positions cache...")
 
     def cb_s3(done: int, total: int):
         pct = 0.65 + 0.33 * (done / max(1, total))
-        pbar.progress(min(0.98, pct), text=f"🔬 Bước 3B: Đang kéo Activity chuyên sâu cho {done}/{total} ứng viên sáng giá...")
+        pbar.progress(min(0.98, pct), text=f"🔬 Bước 3B: Đang kéo Activity kiểm tra TWAP/Pre-match cho {done}/{total} ví...")
 
     df_final_pros, df_s3_all, details_map, s3_stats = step3_deep_ledger_audit(
         df_s2_passed,
@@ -1345,7 +1489,7 @@ def _execute_steps_2_3(df_s1: pd.DataFrame, meta: dict[str, Any]) -> None:
         activity_cache=st.session_state["activity_cache"],
         progress_cb=cb_s3,
     )
-    pbar.progress(1.0, text="✅ Hoàn tất toàn bộ 3 bước!")
+    pbar.progress(1.0, text="✅ Hoàn tất kiểm toán 6 Lưới Lọc!")
     time.sleep(0.2)
     pbar.empty()
 
@@ -1408,34 +1552,38 @@ if meta_res:
             f"{s3_stats.get('stage3b_count', 0)}/{s3_stats.get('input_count', 0)} ví",
             f"Dừng sớm {s3_stats.get('input_count', 0) - s3_stats.get('stage3b_count', 0)} ví ở 3A",
         )
-        m4.metric("🏆 CHUẨN PRO", f"{s3_stats.get('passed_count', 0)} ví", f"B3: {s3_stats.get('elapsed_s', 0)}s • Theo dõi: {s3_stats.get('watch_count', 0)}")
+        m4.metric("🏆 ĐẠT 6/6 LƯỚI PRO", f"{s3_stats.get('passed_count', 0)} ví", f"B3: {s3_stats.get('elapsed_s', 0)}s • Sát chuẩn 5/6: {s3_stats.get('watch_count', 0)}")
 
         s3_col_cfg = {
             "rank": st.column_config.NumberColumn("Hạng LB", format="#%d", width="small"),
             "s3_verdict": st.column_config.TextColumn("Kết luận B3", width="medium"),
-            "copy_score": st.column_config.ProgressColumn("Copy Score", min_value=0, max_value=100, format="%d/100"),
+            "gate_badge": st.column_config.TextColumn("Lưới đạt", width="small"),
             "user_name": st.column_config.TextColumn("Tên hiển thị", width="medium"),
             "wallet": st.column_config.TextColumn("Địa chỉ ví", width="medium"),
+            "med_hold_h": st.column_config.NumberColumn("Hold TB", format="%.1fh"),
+            "live_cap_pct": st.column_config.NumberColumn("% Vốn Live", format="%.2f%%"),
+            "big_single_shot_pct": st.column_config.NumberColumn("% Lớn 1-Lệnh", format="%.0f%%"),
+            "med_clip_usdc": st.column_config.NumberColumn("Clip TB", format="$%,.0f"),
+            "zero_sell_pct": st.column_config.NumberColumn("Zero-Sell", format="%.0f%%"),
+            "hold_pnl_share_pct": st.column_config.NumberColumn("% Lãi REDEEM", format="%.0f%%"),
             "true_cost_usdc": st.column_config.NumberColumn("Vốn 1 chiều ($)", format="$%,.0f"),
             "ledger_pnl_usdc": st.column_config.NumberColumn("Net PnL sổ cái", format="$%+,.0f"),
             "true_roi_pct": st.column_config.NumberColumn("True ROI", format="%+.1f%%"),
             "cap_wr_pct": st.column_config.NumberColumn("CapWR", format="%.1f%%"),
-            "w_entry_pct": st.column_config.NumberColumn("Giá mua TB", format="%.1f%%"),
+            "conviction_lift_pct": st.column_config.NumberColumn("Conv.Lift", format="%+.1f%%"),
             "cap_edge_pct": st.column_config.NumberColumn("CapEdge", format="%+.1f%%"),
             "z_score": st.column_config.NumberColumn("Z-score", format="%.2f"),
-            "hold_pnl_share_pct": st.column_config.NumberColumn("% Lãi REDEEM", format="%.0f%%"),
-            "act_match_info": st.column_config.TextColumn("Khớp Act", width="small"),
             "core_band_pct": st.column_config.NumberColumn("% Vốn 20-85%", format="%.0f%%"),
+            "hedged_pct": st.column_config.NumberColumn("% Hedge", format="%.1f%%"),
+            "max_bet_share_pct": st.column_config.NumberColumn("Max Kèo %", format="%.1f%%"),
             "pnl_ex_top5": st.column_config.NumberColumn("PnL ex-Top 5", format="$%+,.0f"),
-            "top20_roi_pct": st.column_config.NumberColumn("Top20% ROI", format="%+.1f%%"),
-            "med_buys": st.column_config.NumberColumn("MedBuys", format="%.1f"),
-            "gradual_pct": st.column_config.NumberColumn("% Gom từ từ", format="%.0f%%"),
-            "s3_flags": st.column_config.TextColumn("Chẩn đoán & Cờ rủi ro", width="large"),
+            "act_match_info": st.column_config.TextColumn("Khớp Act", width="small"),
+            "s3_flags": st.column_config.TextColumn("Chi tiết Lưới Rớt / Chẩn đoán", width="large"),
             "profile_url": st.column_config.LinkColumn("Polymarket", display_text="Mở Profile"),
         }
         s3_cols = [c for c in s3_col_cfg.keys() if c in df_s3_all.columns]
 
-        st.subheader(f"🏆 Bảng Xếp Hạng Kiểm Toán Sổ Cái Bước 3 ({len(df_s3_all)} ví đã qua Bước 2)")
+        st.subheader(f"🏆 Bảng Kiểm Toán 6 Lưới Lọc Bước 3 ({len(df_s3_all)} ví đã qua Bước 2)")
         if df_s3_all.empty:
             st.warning("Không có ví nào vượt qua Bước 2 để đưa vào Bước 3.")
         else:
@@ -1450,7 +1598,7 @@ if meta_res:
             for _, r in df_s3_all.iterrows():
                 w = str(r["wallet"]).strip().lower()
                 if w in details_map:
-                    lbl = f"#{int(r['rank'])} | {r['s3_verdict']} ({int(r['copy_score'])}/100) — {r['user_name']} ({w[:8]}...)"
+                    lbl = f"#{int(r['rank'])} | {r['s3_verdict']} ({r['gate_badge']}) — {r['user_name']} ({w[:8]}...)"
                     label_to_wallet[lbl] = w
 
             if label_to_wallet:
@@ -1503,38 +1651,69 @@ if meta_res:
                         )
                     st.dataframe(pd.DataFrame(b_rows), use_container_width=True, hide_index=True)
 
-                st.markdown("**3. Kỷ luật đi tiền theo Quy mô kèo (Conviction Sizing)**")
-                q50 = pos_x["true_cost"].quantile(0.50)
-                q80 = pos_x["true_cost"].quantile(0.80)
-                pos_x["size_tier"] = np.where(
-                    pos_x["true_cost"] >= q80,
-                    f"Top 20% Kèo Lớn (>= ${q80:,.1f})",
-                    np.where(
-                        pos_x["true_cost"] > q50,
-                        f"Nhóm Trung Bình (${q50:,.1f} – ${q80:,.1f})",
-                        f"Bottom 50% Kèo Nhỏ (<= ${q50:,.1f})",
-                    ),
-                )
-                t_rows = []
-                for t_n, g in pos_x.groupby("size_tier"):
-                    gc = float(g["true_cost"].sum())
-                    gp = float(g["total_pnl"].sum())
-                    t_rows.append(
-                        {
-                            "Phân khúc quy mô": t_n,
-                            "Số vị thế": len(g),
-                            "Win Rate": f"{g['real_win'].mean() * 100:.1f}%",
-                            "Tổng vốn ($)": round(gc, 1),
-                            "PnL ($)": round(gp, 1),
-                            "ROI": f"{gp / gc * 100 if gc > 0 else 0:+.1f}%",
-                        }
+                x_bot_l, x_bot_r = st.columns(2)
+                with x_bot_l:
+                    st.markdown("**3. Kỷ luật đi tiền theo Quy mô kèo (Conviction Sizing)**")
+                    q50 = pos_x["true_cost"].quantile(0.50)
+                    q80 = pos_x["true_cost"].quantile(0.80)
+                    pos_x["size_tier"] = np.where(
+                        pos_x["true_cost"] >= q80,
+                        f"Top 20% Kèo Lớn (>= ${q80:,.1f})",
+                        np.where(
+                            pos_x["true_cost"] > q50,
+                            f"Nhóm Trung Bình (${q50:,.1f} – ${q80:,.1f})",
+                            f"Bottom 50% Kèo Nhỏ (<= ${q50:,.1f})",
+                        ),
                     )
-                st.dataframe(pd.DataFrame(t_rows), use_container_width=True, hide_index=True)
+                    t_rows = []
+                    for t_n, g in pos_x.groupby("size_tier"):
+                        gc = float(g["true_cost"].sum())
+                        gp = float(g["total_pnl"].sum())
+                        t_rows.append(
+                            {
+                                "Phân khúc quy mô": t_n,
+                                "Số vị thế": len(g),
+                                "Win Rate": f"{g['real_win'].mean() * 100:.1f}%",
+                                "Tổng vốn ($)": round(gc, 1),
+                                "PnL ($)": round(gp, 1),
+                                "ROI": f"{gp / gc * 100 if gc > 0 else 0:+.1f}%",
+                            }
+                        )
+                    st.dataframe(pd.DataFrame(t_rows), use_container_width=True, hide_index=True)
+
+                with x_bot_r:
+                    st.markdown("**4. Giải phẫu Nhịp Vào Lệnh & Gom TWAP (Pre-match vs. Live)**")
+                    valid_h = pos_x[pos_x["hold_hours"].notna()].copy()
+                    if valid_h.empty:
+                        st.info("Ví này chưa có đủ dữ liệu thời gian Hold khớp Activity.")
+                    else:
+                        h_bins = [0.0, 1.5, 4.0, 12.0, 1e9]
+                        h_labels = ["< 1.5h (Nghi Live)", "1.5h – 4h (Sát giờ)", "4h – 12h (Pre-match)", "> 12h (Vào sớm)"]
+                        valid_h["hold_tier"] = pd.cut(valid_h["hold_hours"], bins=h_bins, labels=h_labels, right=False)
+                        h_rows = []
+                        for h_n, g in valid_h.groupby("hold_tier", observed=False):
+                            if len(g) == 0:
+                                continue
+                            gc = float(g["true_cost"].sum())
+                            gp = float(g["total_pnl"].sum())
+                            h_rows.append(
+                                {
+                                    "Khung giữ lệnh": str(h_n),
+                                    "Số kèo": len(g),
+                                    "Vốn ($)": round(gc, 1),
+                                    "% Vốn": f"{gc / tot_c * 100 if tot_c > 0 else 0:.1f}%",
+                                    "PnL ($)": round(gp, 1),
+                                    "Số lệnh mua TB": f"{g['buy_count'].mean():.1f}",
+                                    "Clip TB ($)": f"${g['avg_clip_usdc'].median():,.0f}",
+                                }
+                            )
+                        st.dataframe(pd.DataFrame(h_rows), use_container_width=True, hide_index=True)
 
                 export_pos_cols = [
                     "entry_time_vn", "status", "exit_style", "condition_id", "token_id",
                     "title", "outcome", "is_hedged", "avg_price", "true_cost", "total_pnl",
-                    "roi_pct", "real_win", "buy_count", "sell_count", "accum_hours", "hold_hours", "url",
+                    "roi_pct", "real_win", "buy_count", "sell_count", "avg_clip_usdc",
+                    "buy_price_spread_c", "accum_mins", "hold_hours", "url",
                 ]
                 avail_ex = [c for c in export_pos_cols if c in pos_x.columns]
                 st.download_button(
@@ -1566,9 +1745,9 @@ if meta_res:
         dl1, dl2 = st.columns(2)
         prefix = f"step3_{meta_res['category'].lower()}_{meta_res['time_period'].lower()}"
         dl1.download_button(
-            f"📥 Tải {len(df_final)} ví CHUẨN PRO (CSV)",
+            f"📥 Tải {len(df_final)} ví CHUẨN PRO 6/6 (CSV)",
             data=df_final.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{prefix}_pros.csv",
+            file_name=f"{prefix}_pros_6of6.csv",
             mime="text/csv",
             use_container_width=True,
             disabled=df_final.empty,
