@@ -6,7 +6,47 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import numpy as np
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+import streamlit as st
 
+st.set_page_config(
+    page_title="Polymarket Pro Wallet Finder — 4-Pillar Pipeline",
+    page_icon="📡",
+    layout="wide",
+)
+
+# ==============================================================================
+# CẤU HÌNH HỆ THỐNG & HẰNG SỐ API (DATA API V2)
+# ==============================================================================
+
+LEADERBOARD_V2_URL = "https://data-api.polymarket.com/v2/leaderboard"
+LEADERBOARD_V1_URL = "https://data-api.polymarket.com/v1/leaderboard"
+POSITIONS_V2_URL = "https://data-api.polymarket.com/v2/positions"
+ACTIVITY_V2_URL = "https://data-api.polymarket.com/v2/activity"
+
+VN_TZ = timezone(timedelta(hours=7))
+EVM_ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+_THREAD_LOCAL = threading.local()
+
+CATEGORY_OPTIONS: dict[str, str] = {
+    "Esports (CS2, Dota 2, LoL, Valorant...)": "ESPORTS",
+    "Sports (NBA, Tennis, Bóng đá, UFC...)": "SPORTS",
+    "Finance (Chỉ số, Cổ phiếu, Vàng, Hàng hóa)": "FINANCE",
+    "Economics (Lãi suất Fed, CPI, GDP, Vĩ mô)": "ECONOMICS",
+    "Weather (Thời tiết & Nhiệt độ)": "WEATHER",
+    "Politics (Chính trị & Bầu cử)": "POLITICS",
+    "Crypto (Tiền mã hóa)": "CRYPTO",
+    "Culture (Văn hóa & Giải trí)": "CULTURE",
+    "Mentions (Từ khóa & Phát ngôn)": "MENTIONS",
+    "Tech (Công nghệ & AI)": "TECH",
+    "All Categories (Toàn sàn Polymarket)": "OVERALL",
+}
+
+RANGE_OPTIONS: dict[str, str] = {
+    "Today (24h qua)": "day",
     "Weekly (7 ngày qua)": "week",
     "Monthly (30 ngày qua)": "month",
     "All (Toàn thời gian)": "all",
