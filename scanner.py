@@ -13,7 +13,7 @@ from requests.adapters import HTTPAdapter
 import streamlit as st
 
 st.set_page_config(
-    page_title="Polymarket Pro Wallet Finder — 4-Pillar Pipeline (v5.3)",
+    page_title="Polymarket Pro Wallet Finder — 4-Pillar Pipeline (v5.3.1)",
     page_icon="📡",
     layout="wide",
 )
@@ -64,7 +64,7 @@ def get_http_session() -> requests.Session:
         sess.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "Polymarket-Wallet-Finder/5.3-4Pillars",
+                "User-Agent": "Polymarket-Wallet-Finder/5.3.1-4Pillars",
             }
         )
         _THREAD_LOCAL.session = sess
@@ -934,7 +934,15 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
         ("first_ts", np.nan),
         ("vwap_buy_ts", np.nan),
     ]:
-        pos_df[col] = act_merged[col].fillna(def_v) if col in act_merged.columns else def_v
+        if col in act_merged.columns:
+            if isinstance(def_v, bool):
+                pos_df[col] = act_merged[col].where(act_merged[col].notna(), def_v).astype(bool)
+            elif isinstance(def_v, int):
+                pos_df[col] = pd.to_numeric(act_merged[col], errors="coerce").fillna(def_v).astype(int)
+            else:
+                pos_df[col] = pd.to_numeric(act_merged[col], errors="coerce").fillna(def_v).astype(float)
+        else:
+            pos_df[col] = def_v
 
     pos_df["avg_price"] = np.where(
         pos_df["avg_price"] > 0.001,
@@ -1040,13 +1048,14 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
     hedged_cids = set(cid_counts[cid_counts >= 2].index)
     pos_df["is_hedged"] = pos_df["condition_id"].isin(hedged_cids)
 
+    has_act = pos_df["has_act_match"].to_numpy(dtype=bool)
     exit_conditions = [
-        pos_df["status"] == "OPEN",
-        pos_df["status"] == "SETTLED_LOSS_0C",
-        ~pos_df["has_act_match"],
-        pos_df["sell_count"] == 0,
-        (pos_df["act_redeem_usdc"] <= 0) & (pos_df["act_sell_usdc"] > 0),
-        (pos_df["act_redeem_usdc"] > 0) & (pos_df["act_sell_usdc"] < 0.25 * np.maximum(pos_df["true_cost"], 1e-6)),
+        (pos_df["status"] == "OPEN").to_numpy(dtype=bool),
+        (pos_df["status"] == "SETTLED_LOSS_0C").to_numpy(dtype=bool),
+        ~has_act,
+        (pos_df["sell_count"] == 0).to_numpy(dtype=bool),
+        ((pos_df["act_redeem_usdc"] <= 0) & (pos_df["act_sell_usdc"] > 0)).to_numpy(dtype=bool),
+        ((pos_df["act_redeem_usdc"] > 0) & (pos_df["act_sell_usdc"] < 0.25 * np.maximum(pos_df["true_cost"], 1e-6))).to_numpy(dtype=bool),
     ]
     exit_choices = [
         "OPEN_LIVE",
@@ -1354,7 +1363,6 @@ def step3_deep_ledger_audit(
                 details_map[w] = pre_df
         else:
             stage3b_candidates.append(w)
-            # Nếu seed_acts đã phủ đủ toàn bộ lịch sử (< 100 records) hoặc khớp 100% vị thế, lưu thẳng khỏi gọi mạng
             if w not in activity_cache or not activity_cache[w]:
                 all_matched = (not pre_df.empty) and bool(pre_df["has_act_match"].all())
                 if (0 < len(seed_acts) < 100) or all_matched:
@@ -1416,10 +1424,10 @@ def step3_deep_ledger_audit(
 
 
 # ==============================================================================
-# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN FULL PIPELINE 4 LƯỚI LỌC TINH GỌN (v5.3)
+# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN FULL PIPELINE 4 LƯỚI LỌC TINH GỌN (v5.3.1)
 # ==============================================================================
 
-st.title("📡 Polymarket Pro Wallet Finder — 4-Pillar Pipeline (v5.3)")
+st.title("📡 Polymarket Pro Wallet Finder — 4-Pillar Pipeline (v5.3.1)")
 st.caption(
     "**Bước 1:** Kéo Leaderboard / Soi trực tiếp `0x...` → "
     "**Bước 2:** Lọc bề mặt & cache sổ vị thế → "
