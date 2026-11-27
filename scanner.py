@@ -13,7 +13,7 @@ from requests.adapters import HTTPAdapter
 import streamlit as st
 
 st.set_page_config(
-    page_title="Polymarket Pro Wallet Finder — 4-Pillar Pipeline (v5.5)",
+    page_title="Polymarket Pro Wallet Finder — 4-Pillar Pipeline (v5.6)",
     page_icon="📡",
     layout="wide",
 )
@@ -64,7 +64,7 @@ def get_http_session() -> requests.Session:
         sess.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "Polymarket-Wallet-Finder/5.5-4Pillars",
+                "User-Agent": "Polymarket-Wallet-Finder/5.6-4Pillars",
             }
         )
         _THREAD_LOCAL.session = sess
@@ -1101,7 +1101,7 @@ def _build_ledger_from_raw(raw_pos: list[dict[str, Any]], raw_act: list[dict[str
 
 
 def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_only: bool = False) -> dict[str, Any]:
-    """Đánh giá ví qua 4 Lưới Lọc Tinh Gọn với Share-Weighted True Edge & Z-score."""
+    """Đánh giá ví qua 4 Lưới Lọc Tinh Gọn với Share-Weighted True Edge, Z-score, Dải 20-80% & Size Trung Vị."""
     empty_res = {
         "s3_verdict": "❌ KHÔNG DỮ LIỆU",
         "s3_passed": False,
@@ -1119,6 +1119,7 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
         "z_score": 0.0,
         "med_hold_h": 0.0,
         "live_cap_pct": 0.0,
+        "med_pos_usdc": 0.0,
         "med_clip_usdc": 0.0,
         "zero_sell_pct": 0.0,
         "hold_pnl_share_pct": 0.0,
@@ -1200,11 +1201,12 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
         tot_pos = pos_hold + pos_early
         hold_pnl_share = (pos_hold / tot_pos * 100.0) if tot_pos > 0 else 0.0
 
-    # --- Lưới 1 & 2: Timing Pre-match & Diamond Hands ---
-    act_matched_all = pos_df[pos_df["has_act_match"]]
+    # --- Lưới 1 & 2: Timing Pre-match, Quy mô kèo & Diamond Hands ---
+    act_matched_settled = settled_df[settled_df["has_act_match"]]
     buy_matched = pos_df[pos_df["buy_count"] > 0]
-    zero_sell_pct = float((act_matched_all["sell_count"] == 0).mean() * 100.0) if not act_matched_all.empty else 0.0
+    zero_sell_pct = float((act_matched_settled["sell_count"] == 0).mean() * 100.0) if not act_matched_settled.empty else 0.0
     med_clip_usdc = float(buy_matched["avg_clip_usdc"].median()) if not buy_matched.empty else 0.0
+    med_pos_usdc = float(settled_df["true_cost"].median())
 
     live_cutoff_h = float(cfg["live_cutoff_hours"])
     valid_holds = pos_df[pos_df["hold_hours"].notna()].copy()
@@ -1220,14 +1222,14 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
         med_hold_h = 0.0
         live_cap_pct = 0.0
 
-    # --- Lưới 4: Dải xác suất & Rủi ro ---
+    # --- Lưới 4: Dải xác suất 20-80% & Rủi ro ---
     if priced_cost > 0:
         core_band_pct = float(
-            priced_df[(priced_df["avg_price"] >= 0.15) & (priced_df["avg_price"] <= 0.90)]["true_cost"].sum()
+            priced_df[(priced_df["avg_price"] >= 0.20) & (priced_df["avg_price"] <= 0.80)]["true_cost"].sum()
             / priced_cost
             * 100.0
         )
-        high_fav_pct = float(priced_df[priced_df["avg_price"] >= 0.95]["true_cost"].sum() / priced_cost * 100.0)
+        high_fav_pct = float(priced_df[priced_df["avg_price"] >= 0.85]["true_cost"].sum() / priced_cost * 100.0)
     else:
         core_band_pct = 100.0
         high_fav_pct = 0.0
@@ -1247,10 +1249,12 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
     failed_gates: list[str] = []
     passed_cnt = 0
 
-    # Lưới 1: Chống Trade Live & Mua sát giờ thi đấu
+    # Lưới 1: Chống Trade Live, Mua sát giờ & Chặn ví lệnh siêu nhỏ
     g1_reasons = []
     if len(act_matched_only) < int(cfg["min_act_matched"]):
         g1_reasons.append(f"ít mẫu khớp Act ({len(act_matched_only)}<{cfg['min_act_matched']})")
+    if med_pos_usdc < float(cfg["min_med_pos_usdc"]):
+        g1_reasons.append(f"size kèo TB bé (${med_pos_usdc:,.0f}<${cfg['min_med_pos_usdc']:,.0f})")
     if len(valid_holds) >= 5 and med_hold_h < float(cfg["min_hold_hours"]):
         g1_reasons.append(f"vào sát giờ/Live (Hold TB {med_hold_h:.1f}h<{cfg['min_hold_hours']:.1f}h)")
     if len(valid_holds) >= 5 and live_cap_pct > float(cfg["max_live_cap_pct"]):
@@ -1258,9 +1262,9 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
     if not g1_reasons and not stage3a_only:
         passed_cnt += 1
     else:
-        failed_gates.append("L1-Timing: " + (", ".join(g1_reasons) if g1_reasons else "chưa kéo Act"))
+        failed_gates.append("L1-Timing/Size: " + (", ".join(g1_reasons) if g1_reasons else "chưa kéo Act"))
 
-    # Lưới 2: Kỷ luật giữ đáo hạn (Diamond Hands)
+    # Lưới 2: Kỷ luật giữ đáo hạn (Diamond Hands >= 80%)
     g2_reasons = []
     if zero_sell_pct < float(cfg["min_zero_sell_pct"]):
         g2_reasons.append(f"hay bán non (ZeroSell={zero_sell_pct:.0f}%<{cfg['min_zero_sell_pct']:.0f}%)")
@@ -1271,7 +1275,7 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
     else:
         failed_gates.append("L2-Đáo hạn: " + (", ".join(g2_reasons) if g2_reasons else "chưa kéo Act"))
 
-    # Lưới 3: Lợi thế dự báo thực & Kiểm định thống kê
+    # Lưới 3: Lợi thế dự báo thực & Kiểm định thống kê (Z >= 1.65)
     g3_reasons = []
     if true_roi < float(cfg["min_true_roi"]):
         g3_reasons.append(f"ROI {true_roi:+.1f}%<{cfg['min_true_roi']:.1f}%")
@@ -1284,12 +1288,14 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
     else:
         failed_gates.append("L3-Edge: " + ", ".join(g3_reasons))
 
-    # Lưới 4: Dải xác suất & Quản trị rủi ro (gồm chống gồng lỗ OPEN)
+    # Lưới 4: Khóa dải xác suất 20-80% & Quản trị rủi ro
     g4_reasons = []
+    if w_entry > float(cfg["max_w_entry"]):
+        g4_reasons.append(f"giá mua TB cao ({w_entry:.1f}%>{cfg['max_w_entry']:.0f}%)")
     if core_band_pct < float(cfg["min_core_band"]):
-        g4_reasons.append(f"dải 15-90% thấp ({core_band_pct:.0f}%<{cfg['min_core_band']:.0f}%)")
+        g4_reasons.append(f"dải 20-80% thấp ({core_band_pct:.0f}%<{cfg['min_core_band']:.0f}%)")
     if high_fav_pct > float(cfg["max_high_fav"]):
-        g4_reasons.append(f"bẫy Fav >=95¢ ({high_fav_pct:.1f}%>{cfg['max_high_fav']:.0f}%)")
+        g4_reasons.append(f"bẫy cửa trên >=85¢ ({high_fav_pct:.1f}%>{cfg['max_high_fav']:.0f}%)")
     if hedged_cap_pct > float(cfg["max_hedged_pct"]):
         g4_reasons.append(f"vốn hedge 2 đầu ({hedged_cap_pct:.1f}%>{cfg['max_hedged_pct']:.0f}%)")
     if bool(cfg["require_ex_top5"]) and pnl_ex_top5 <= 0:
@@ -1331,6 +1337,7 @@ def _evaluate_ledger_pillars(pos_df: pd.DataFrame, cfg: dict[str, Any], stage3a_
         "z_score": round(z_score, 2),
         "med_hold_h": round(med_hold_h, 1),
         "live_cap_pct": round(live_cap_pct, 1),
+        "med_pos_usdc": round(med_pos_usdc, 0),
         "med_clip_usdc": round(med_clip_usdc, 0),
         "zero_sell_pct": round(zero_sell_pct, 0),
         "hold_pnl_share_pct": round(hold_pnl_share, 1),
@@ -1452,10 +1459,10 @@ def step3_deep_ledger_audit(
 
 
 # ==============================================================================
-# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN FULL PIPELINE 4 LƯỚI LỌC (v5.5)
+# GIAO DIỆN STREAMLIT ĐIỀU KHIỂN FULL PIPELINE 4 LƯỚI LỌC (v5.6)
 # ==============================================================================
 
-st.title("📡 Polymarket Pro Wallet Finder — 4-Pillar Copy-Trade Pipeline (v5.5)")
+st.title("📡 Polymarket Pro Wallet Finder — 4-Pillar Copy-Trade Pipeline (v5.6)")
 st.caption(
     "**Bước 1:** Kéo Leaderboard / Soi trực tiếp `0x...` → "
     "**Bước 2:** Lọc bề mặt & độ tươi 7 ngày → "
@@ -1465,7 +1472,7 @@ st.caption(
 s1, s2, s3 = st.columns(3)
 s1.success("✅ **Bước 1: Thu thập Leaderboard**\n\nChia lô an toàn + Soi trực tiếp ví `0x...`")
 s2.success("✅ **Bước 2: Lọc & Cache Positions**\n\nSăn gem từ $1k • 100–4,000 kèo • <= 7 ngày")
-s3.success("✅ **Bước 3: 4 Lưới Lọc & Xuất CSV**\n\nKiểm toán 4 Lưới • Xuất sổ cái nguyên tử")
+s3.success("✅ **Bước 3: 4 Lưới Lọc & Xuất CSV**\n\nĐáo hạn >=80% • Dải 20–80% • Size >=$300 • Z>=1.65")
 
 for key, default_val in [
     ("df_step1_raw", pd.DataFrame()),
@@ -1496,7 +1503,14 @@ with st.sidebar:
     st.header("🔬 Bước 3: 4 Lưới Lọc Sổ Cái")
     allow_3_of_4_pro = st.checkbox("Chấp nhận ví đạt 3/4 Lưới vào danh sách Pro", value=False)
 
-    with st.expander("⏱️ Lưới 1 & 2: Chống Live & Diamond Hands", expanded=True):
+    with st.expander("⏱️ Lưới 1 & 2: Chống Live, Quy Mô & Diamond Hands", expanded=True):
+        min_med_pos_usdc = st.number_input(
+            "Quy mô kèo trung vị tối thiểu ($)",
+            min_value=0.0,
+            value=300.0,
+            step=50.0,
+            help="Loại các ví đánh lệnh siêu nhỏ ($10–$50/kèo) không thể nhân hệ số copy.",
+        )
         min_hold_hours = st.slider(
             "Hold trung vị tối thiểu (giờ)",
             1.0,
@@ -1515,22 +1529,30 @@ with st.sidebar:
         )
         max_live_cap_pct = st.slider("Trần % vốn vào Live / Sát trận", 0.0, 50.0, 20.0, 2.5)
         min_act_matched = st.number_input("Số kèo khớp Activity tối thiểu", min_value=5, max_value=200, value=25, step=5)
-        min_hold_redeem = st.slider("% Lãi giữ đáo hạn REDEEM", 40.0, 100.0, 75.0, 5.0)
-        min_zero_sell_pct = st.slider("% Kèo giữ tuyệt đối không bán non", 30.0, 100.0, 65.0, 5.0)
+        min_hold_redeem = st.slider("% Lãi giữ đáo hạn REDEEM", 40.0, 100.0, 80.0, 5.0)
+        min_zero_sell_pct = st.slider("% Kèo giữ tuyệt đối không bán non", 30.0, 100.0, 75.0, 5.0)
 
-    with st.expander("📈 Lưới 3 & 4: True Edge, Z-score & Rủi Ro", expanded=True):
+    with st.expander("📈 Lưới 3 & 4: True Edge, Z-score & Dải 20–80%", expanded=True):
         min_true_roi = st.slider("True ROI 1 chiều tối thiểu (%)", 0.0, 30.0, 5.0, 0.5)
-        min_cap_edge = st.slider("TrueEdge tối thiểu (+%)", -2.0, 15.0, 2.5, 0.5)
+        min_cap_edge = st.slider("TrueEdge tối thiểu (+%)", -2.0, 15.0, 3.0, 0.5)
         min_z_score = st.slider(
             "Z-score trọng số vốn tối thiểu",
             0.0,
             3.5,
-            1.50,
-            0.10,
-            help="Đo ý nghĩa thống kê của lợi nhuận vượt giá thị trường (Z >= 1.50 tương đương độ tin cậy > 93%).",
+            1.65,
+            0.05,
+            help="Đo ý nghĩa thống kê của lợi nhuận vượt giá thị trường (Z >= 1.65 tương đương độ tin cậy > 95%).",
         )
-        min_core_band = st.slider("% Vốn dải lõi 15%–90%", 40.0, 95.0, 65.0, 5.0)
-        max_high_fav = st.slider("Trần vốn dải >=95¢ (%)", 0.0, 40.0, 15.0, 2.5)
+        max_w_entry = st.slider(
+            "Trần giá mua TB gia quyền (%)",
+            50.0,
+            95.0,
+            78.0,
+            2.0,
+            help="Chặn các ví chuyên cày cửa trên 80¢–99¢ chịu rủi ro sập sâu.",
+        )
+        min_core_band = st.slider("% Vốn dải lõi 20%–80%", 40.0, 95.0, 70.0, 5.0)
+        max_high_fav = st.slider("Trần vốn cửa trên >=85¢ (%)", 0.0, 40.0, 15.0, 2.5)
         max_hedged_pct = st.slider("Trần % Vốn Hedge 2 đầu", 0.0, 30.0, 10.0, 2.0)
         require_ex_top5 = st.checkbox("Bắt buộc PnL ngoài Top 5 kèo > $0", value=True)
         require_open_net_positive = st.checkbox("Cấm gồng lỗ OPEN (Tổng PnL cả OPEN > $0)", value=True)
@@ -1555,6 +1577,7 @@ step2_cfg = {
 
 step3_cfg = {
     "allow_3_of_4_pro": allow_3_of_4_pro,
+    "min_med_pos_usdc": min_med_pos_usdc,
     "min_hold_hours": min_hold_hours,
     "live_cutoff_hours": live_cutoff_hours,
     "max_live_cap_pct": max_live_cap_pct,
@@ -1564,6 +1587,7 @@ step3_cfg = {
     "min_true_roi": min_true_roi,
     "min_cap_edge": min_cap_edge,
     "min_z_score": min_z_score,
+    "max_w_entry": max_w_entry,
     "min_core_band": min_core_band,
     "max_high_fav": max_high_fav,
     "max_hedged_pct": max_hedged_pct,
@@ -1739,9 +1763,9 @@ if meta_res:
             "gate_badge": st.column_config.TextColumn("Lưới đạt", width="small"),
             "user_name": st.column_config.TextColumn("Tên hiển thị", width="medium"),
             "wallet": st.column_config.TextColumn("Địa chỉ ví", width="medium"),
+            "med_pos_usdc": st.column_config.NumberColumn("Size Kèo TB", format="$%,.0f"),
             "med_hold_h": st.column_config.NumberColumn("Hold TB", format="%.1fh"),
             "live_cap_pct": st.column_config.NumberColumn("% Vốn Live/Sát giờ", format="%.1f%%"),
-            "med_clip_usdc": st.column_config.NumberColumn("Clip TB", format="$%,.0f"),
             "zero_sell_pct": st.column_config.NumberColumn("Zero-Sell", format="%.0f%%"),
             "hold_pnl_share_pct": st.column_config.NumberColumn("% Lãi REDEEM", format="%.0f%%"),
             "true_cost_usdc": st.column_config.NumberColumn("Vốn 1 chiều ($)", format="$%,.0f"),
@@ -1749,10 +1773,10 @@ if meta_res:
             "open_pnl_usdc": st.column_config.NumberColumn("PnL đang OPEN", format="$%+,.0f"),
             "true_roi_pct": st.column_config.NumberColumn("True ROI", format="%+.1f%%"),
             "cap_wr_pct": st.column_config.NumberColumn("ShareWR", format="%.1f%%"),
-            "w_entry_pct": st.column_config.NumberColumn("BreakEven WR", format="%.1f%%"),
+            "w_entry_pct": st.column_config.NumberColumn("Giá Mua TB", format="%.1f%%"),
             "cap_edge_pct": st.column_config.NumberColumn("TrueEdge", format="%+.1f%%"),
             "z_score": st.column_config.NumberColumn("Z-score", format="%.2f"),
-            "core_band_pct": st.column_config.NumberColumn("% Vốn 15-90%", format="%.0f%%"),
+            "core_band_pct": st.column_config.NumberColumn("% Vốn 20-80%", format="%.0f%%"),
             "hedged_cap_pct": st.column_config.NumberColumn("% Vốn Hedge", format="%.1f%%"),
             "pnl_ex_top5": st.column_config.NumberColumn("PnL ex-Top 5", format="$%+,.0f"),
             "act_match_info": st.column_config.TextColumn("Khớp Act", width="small"),
@@ -1805,9 +1829,9 @@ if meta_res:
                     f"Edge: {picked_row['cap_edge_pct']:+.1f}% • Z={picked_row['z_score']:.2f}",
                 )
                 k4.metric(
-                    "Timing & Đáo hạn",
-                    f"Hold TB {picked_row['med_hold_h']:.1f}h",
-                    f"REDEEM: {picked_row['hold_pnl_share_pct']:.0f}% • Live: {picked_row['live_cap_pct']:.1f}%",
+                    "Size TB & Đáo hạn",
+                    f"${picked_row['med_pos_usdc']:,.0f} / kèo",
+                    f"REDEEM: {picked_row['hold_pnl_share_pct']:.0f}% • Hold: {picked_row['med_hold_h']:.1f}h",
                 )
 
                 export_pos_cols = [
